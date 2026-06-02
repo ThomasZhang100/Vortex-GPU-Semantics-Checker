@@ -290,6 +290,15 @@ module VX_core import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef CHECKER_ENABLE
+    // Default tap window — override at build time with
+    //   CONFIGS="-DCHECKER_ENABLE -DTAP_ADDR=0x... -DTAP_LEN=0x..."
+    `ifndef TAP_ADDR
+    `define TAP_ADDR 32'h10000
+    `endif
+    `ifndef TAP_LEN
+    `define TAP_LEN  32'h1000
+    `endif
+
     // Flatten dcache bus signals so the purely-passive checker needs no modport.
     wire [DCACHE_NUM_REQS-1:0]                        chk_dcache_req_valid;
     wire [DCACHE_NUM_REQS-1:0]                        chk_dcache_req_rw;
@@ -305,10 +314,9 @@ module VX_core import VX_gpu_pkg::*; #(
         // ADDI x0, x0, 2047 — true NOP, unique immediate, never in normal code.
         // Kernel emits this via: asm volatile("addi x0, x0, 2047");
         .TRIGGER_INSTR (32'h7FF00013),
-        // TAP_ADDR and TAP_LEN must match the hidden-state buffer address
-        // and size used in the test kernel (set to match vx_mem_alloc result).
-        .TAP_ADDR      (`MEM_ADDR_WIDTH'h20000000),
-        .TAP_LEN       (`MEM_ADDR_WIDTH'h00002000)
+        // Pass TAP_ADDR/TAP_LEN from -D flags; defaults set above.
+        .TAP_ADDR      (`MEM_ADDR_WIDTH'(`TAP_ADDR)),
+        .TAP_LEN       (`MEM_ADDR_WIDTH'(`TAP_LEN))
     ) sem_checker (
         .clk              (clk),
         .reset            (reset),
