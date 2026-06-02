@@ -11,7 +11,3 @@ build/
 *.vxbin
 *.dump
 *.log
-/third_party/softfloat/
-/third_party/ramulator/
-/third_party/cvfpu/
-/third_party/hardfloat/
