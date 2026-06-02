@@ -309,7 +309,7 @@ module VX_core import VX_gpu_pkg::*; #(
         // and size used in the test kernel (set to match vx_mem_alloc result).
         .TAP_ADDR      (`MEM_ADDR_WIDTH'h20000000),
         .TAP_LEN       (`MEM_ADDR_WIDTH'h00002000)
-    ) checker (
+    ) sem_checker (
         .clk              (clk),
         .reset            (reset),
         .fetch_valid      (fetch_if.valid),
