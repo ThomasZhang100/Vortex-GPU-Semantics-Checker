@@ -290,13 +290,14 @@ module VX_core import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef CHECKER_ENABLE
-    // Default tap window — override at build time with
-    //   CONFIGS="-DCHECKER_ENABLE -DTAP_ADDR=0x... -DTAP_LEN=0x..."
+    // Default tap window — override at build time with decimal values:
+    //   CONFIGS="-DCHECKER_ENABLE -DTAP_ADDR=65536 -DTAP_LEN=64"
+    // (Verilog -D macros must be plain integers, not 0x... C-style hex)
     `ifndef TAP_ADDR
-    `define TAP_ADDR 32'h10000
+    `define TAP_ADDR 65536
     `endif
     `ifndef TAP_LEN
-    `define TAP_LEN  32'h1000
+    `define TAP_LEN  4096
     `endif
 
     // Flatten dcache bus signals so the purely-passive checker needs no modport.
@@ -315,8 +316,8 @@ module VX_core import VX_gpu_pkg::*; #(
         // Kernel emits this via: asm volatile("addi x0, x0, 2047");
         .TRIGGER_INSTR (32'h7FF00013),
         // Pass TAP_ADDR/TAP_LEN from -D flags; defaults set above.
-        .TAP_ADDR      (`MEM_ADDR_WIDTH'(`TAP_ADDR)),
-        .TAP_LEN       (`MEM_ADDR_WIDTH'(`TAP_LEN))
+        .TAP_ADDR      (`TAP_ADDR),
+        .TAP_LEN       (`TAP_LEN)
     ) sem_checker (
         .clk              (clk),
         .reset            (reset),
