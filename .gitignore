@@ -1,0 +1,17 @@
+/build*
+/.vscode
+*.cache
+*.code-workspace
+miscs/apptainer/vortex.sif
+build/
+*.o
+*.a
+*.so
+*.elf
+*.vxbin
+*.dump
+*.log
+/third_party/softfloat/
+/third_party/ramulator/
+/third_party/cvfpu/
+/third_party/hardfloat/
