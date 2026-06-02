@@ -11,3 +11,4 @@ build/
 *.vxbin
 *.dump
 *.log
+CLAUDE.md

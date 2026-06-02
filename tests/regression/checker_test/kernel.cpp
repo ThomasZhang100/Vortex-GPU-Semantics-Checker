@@ -1,0 +1,30 @@
+#include <vx_spawn.h>
+#include "common.h"
+
+void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
+    auto src = reinterpret_cast<float*>(arg->src_addr);
+    auto dst = reinterpret_cast<float*>(arg->dst_addr);
+    uint32_t N = arg->num_elems;
+
+    // Fire the checker trigger.
+    // ADDI x0, x0, 2047 is a true architectural NOP (rd=x0 discards the result)
+    // with a unique immediate that the RTL checker watches for on the fetch bus.
+    asm volatile("addi x0, x0, 2047");
+
+    // Read the entire src buffer. Each load here should appear in the checker's
+    // tap-load trace if the RTL TAP_ADDR/TAP_LEN parameters cover src_addr.
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < N; ++i) {
+        sum += src[i];
+    }
+
+    // Thread 0 of the single task writes the result.
+    dst[blockIdx.x] = sum;
+}
+
+int main() {
+    kernel_arg_t* arg = (kernel_arg_t*)csr_read(VX_CSR_MSCRATCH);
+    // Single task: one thread sums the entire array.
+    uint32_t grid_dim = 1;
+    return vx_spawn_threads(1, &grid_dim, nullptr, (vx_kernel_func_cb)kernel_body, arg);
+}
