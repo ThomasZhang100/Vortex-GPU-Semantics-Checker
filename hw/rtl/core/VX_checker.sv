@@ -46,7 +46,11 @@ module VX_checker import VX_gpu_pkg::*; #(
     // by ascending cache-line address.
     // hidden_layer[line_idx * L1_LINE_SIZE*8 +: L1_LINE_SIZE*8] = cache line at
     //   byte address (TAP_LINE_LO + line_idx) << LINE_BITS.
+    // Suppress the "bits not read" warning — upper bits are assigned for future
+    // SAE compute use; only [63:0] is printed in the current trace.
+    /* verilator lint_off UNUSEDSIGNAL */
     logic [TAP_LINES*`L1_LINE_SIZE*8-1:0] hidden_layer;
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // One bit per cache line — set when that line has been latched.
     logic [TAP_LINES-1:0] line_received;
