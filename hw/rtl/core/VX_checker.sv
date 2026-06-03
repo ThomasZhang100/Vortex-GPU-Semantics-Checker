@@ -55,8 +55,16 @@ module VX_checker import VX_gpu_pkg::*; #(
     // One bit per cache line — set when that line has been latched.
     logic [TAP_LINES-1:0] line_received;
 
-    // Goes high for one cycle when the last expected cache line arrives.
-    wire hidden_layer_valid = triggered && (&line_received);
+    // Combinational: high whenever all lines are in.
+    wire all_lines_received = triggered && (&line_received);
+
+    // Edge-detect: pulse for exactly one cycle on the 0→1 transition.
+    logic all_lines_received_r;
+    always @(posedge clk) begin
+        if (reset) all_lines_received_r <= 0;
+        else       all_lines_received_r <= all_lines_received;
+    end
+    wire hidden_layer_valid = all_lines_received && !all_lines_received_r;
 
     logic triggered;
 
