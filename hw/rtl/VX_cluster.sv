@@ -117,6 +117,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     ///////////////////////////////////////////////////////////////////////////
 
+`ifdef CHECKER_ENABLE
+    wire [NUM_SOCKETS-1:0] per_socket_trigger;
+`endif
+
     wire [NUM_SOCKETS-1:0] per_socket_busy;
 
     // Generate all sockets
@@ -149,10 +153,56 @@ module VX_cluster import VX_gpu_pkg::*; #(
             .gbar_bus_if    (per_socket_gbar_bus_if[socket_id]),
         `endif
 
+        `ifdef CHECKER_ENABLE
+            .trigger_out    (per_socket_trigger[socket_id]),
+        `endif
+
             .busy           (per_socket_busy[socket_id])
         );
     end
 
     `BUFFER_EX(busy, (| per_socket_busy), 1'b1, 1, (NUM_SOCKETS > 1));
+
+`ifdef CHECKER_ENABLE
+    // Flatten all L1→L2 bus signals for the checker.
+    localparam integer CHK_NUM_PORTS = NUM_SOCKETS * `L1_MEM_PORTS;
+    localparam integer CHK_LINE_BITS = `CLOG2(`L1_LINE_SIZE);
+    localparam integer CHK_ADDR_W   = `MEM_ADDR_WIDTH - CHK_LINE_BITS;
+
+    wire [CHK_NUM_PORTS-1:0]                   chk_req_valid;
+    wire [CHK_NUM_PORTS-1:0]                   chk_req_rw;
+    wire [CHK_NUM_PORTS-1:0][CHK_ADDR_W-1:0]  chk_req_addr;
+    wire [CHK_NUM_PORTS-1:0]                   chk_rsp_valid;
+    wire [CHK_NUM_PORTS-1:0][`L1_LINE_SIZE*8-1:0] chk_rsp_data;
+
+    for (genvar p = 0; p < CHK_NUM_PORTS; ++p) begin : g_chk_ports
+        assign chk_req_valid[p] = per_socket_mem_bus_if[p].req_valid;
+        assign chk_req_rw[p]    = per_socket_mem_bus_if[p].req_data.rw;
+        assign chk_req_addr[p]  = per_socket_mem_bus_if[p].req_data.addr;
+        assign chk_rsp_valid[p] = per_socket_mem_bus_if[p].rsp_valid;
+        assign chk_rsp_data[p]  = per_socket_mem_bus_if[p].rsp_data.data;
+    end
+
+    `ifndef TAP_ADDR
+    `define TAP_ADDR 65536
+    `endif
+    `ifndef TAP_LEN
+    `define TAP_LEN  64
+    `endif
+
+    VX_checker #(
+        .TAP_ADDR (`TAP_ADDR),
+        .TAP_LEN  (`TAP_LEN)
+    ) sem_checker (
+        .clk          (clk),
+        .reset        (reset),
+        .trigger_in   (per_socket_trigger[0]),
+        .mem_req_valid(chk_req_valid),
+        .mem_req_rw   (chk_req_rw),
+        .mem_req_addr (chk_req_addr),
+        .mem_rsp_valid(chk_rsp_valid),
+        .mem_rsp_data (chk_rsp_data)
+    );
+`endif
 
 endmodule

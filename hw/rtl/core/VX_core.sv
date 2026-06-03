@@ -41,6 +41,12 @@ module VX_core import VX_gpu_pkg::*; #(
     VX_gbar_bus_if.master   gbar_bus_if,
 `endif
 
+`ifdef CHECKER_ENABLE
+    // Pulsed for one cycle when the trigger instruction is fetched.
+    // Only used externally when this is global core 0.
+    output wire             trigger_out,
+`endif
+
     // Status
     output wire             busy
 );
@@ -290,44 +296,14 @@ module VX_core import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef CHECKER_ENABLE
-    // Default tap window — override at build time with decimal values:
-    //   CONFIGS="-DCHECKER_ENABLE -DTAP_ADDR=65536 -DTAP_LEN=64"
-    // (Verilog -D macros must be plain integers, not 0x... C-style hex)
-    `ifndef TAP_ADDR
-    `define TAP_ADDR 65536
+    // Pulse trigger_out for one cycle when the trigger instruction is fetched.
+    // The instruction encoding (ADDI x0,x0,2047 = 32'h7FF00013) can be
+    // overridden with -DTRIGGER_INSTR=<decimal> in CONFIGS.
+    `ifndef TRIGGER_INSTR
+    `define TRIGGER_INSTR 32'h7FF00013
     `endif
-    `ifndef TAP_LEN
-    `define TAP_LEN  4096
-    `endif
-
-    // Flatten dcache bus signals so the purely-passive checker needs no modport.
-    wire [DCACHE_NUM_REQS-1:0]                        chk_dcache_req_valid;
-    wire [DCACHE_NUM_REQS-1:0]                        chk_dcache_req_rw;
-    wire [DCACHE_NUM_REQS-1:0][DCACHE_ADDR_WIDTH-1:0] chk_dcache_req_addr;
-
-    for (genvar i = 0; i < DCACHE_NUM_REQS; ++i) begin : g_chk_dcache
-        assign chk_dcache_req_valid[i] = dcache_bus_if[i].req_valid;
-        assign chk_dcache_req_rw[i]    = dcache_bus_if[i].req_data.rw;
-        assign chk_dcache_req_addr[i]  = dcache_bus_if[i].req_data.addr;
-    end
-
-    VX_checker #(
-        // ADDI x0, x0, 2047 — true NOP, unique immediate, never in normal code.
-        // Kernel emits this via: asm volatile("addi x0, x0, 2047");
-        .TRIGGER_INSTR (32'h7FF00013),
-        // Pass TAP_ADDR/TAP_LEN from -D flags; defaults set above.
-        .TAP_ADDR      (`TAP_ADDR),
-        .TAP_LEN       (`TAP_LEN)
-    ) sem_checker (
-        .clk              (clk),
-        .reset            (reset),
-        .fetch_valid      (fetch_if.valid),
-        .fetch_ready      (fetch_if.ready),
-        .fetch_instr      (fetch_if.data.instr),
-        .dcache_req_valid (chk_dcache_req_valid),
-        .dcache_req_rw    (chk_dcache_req_rw),
-        .dcache_req_addr  (chk_dcache_req_addr)
-    );
+    assign trigger_out = fetch_if.valid && fetch_if.ready
+                      && (fetch_if.data.instr == `TRIGGER_INSTR);
 `endif
 
 endmodule
