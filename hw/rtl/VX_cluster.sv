@@ -172,13 +172,14 @@ module VX_cluster import VX_gpu_pkg::*; #(
                 `VX_DCR_CHECKER_ENABLE:
                     checker_armed            <= dcr_bus_if.write_data[0];
                 `VX_DCR_CHECKER_TAP_ADDR0:
-                    checker_tap_addr[31:0]   <= dcr_bus_if.write_data;
+                    checker_tap_addr[31:0]                  <= dcr_bus_if.write_data;
             `ifdef XLEN_64
+                // MEM_ADDR_WIDTH=48 for XLEN_64; upper 16 bits come from low 16 of write_data.
                 `VX_DCR_CHECKER_TAP_ADDR1:
-                    checker_tap_addr[63:32]  <= dcr_bus_if.write_data;
+                    checker_tap_addr[`MEM_ADDR_WIDTH-1:32]  <= (`MEM_ADDR_WIDTH-32)'(dcr_bus_if.write_data);
             `endif
                 `VX_DCR_CHECKER_TAP_LEN:
-                    checker_tap_len          <= dcr_bus_if.write_data;
+                    checker_tap_len <= `MEM_ADDR_WIDTH'(dcr_bus_if.write_data);
                 default:;
             endcase
         end

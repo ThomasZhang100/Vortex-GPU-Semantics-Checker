@@ -83,7 +83,9 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     always @(posedge clk) begin
         if (reset || rearm) begin
+            /* verilator lint_off WIDTHCONCAT */
             hidden_layer         <= '0;
+            /* verilator lint_on WIDTHCONCAT */
             lines_received_count <= '0;
             pending              <= '0;
             pending_addr         <= '0;
