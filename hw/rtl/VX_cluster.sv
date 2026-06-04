@@ -162,19 +162,18 @@ module VX_cluster import VX_gpu_pkg::*; #(
     logic [`MEM_ADDR_WIDTH-1:0] checker_tap_addr;
     logic [`MEM_ADDR_WIDTH-1:0] checker_tap_len;
 
+    // No reset condition — mirrors VX_dcr_data.sv (which uses UNUSED_VAR(reset)).
+    // DCR values written before vx_start must survive the RTL reset pulse inside
+    // processor::run(), so this register intentionally ignores reset.
     always @(posedge clk) begin
-        if (reset) begin
-            checker_armed    <= 0;
-            checker_tap_addr <= 0;
-            checker_tap_len  <= 0;
-        end else if (dcr_bus_if.write_valid) begin
+        if (dcr_bus_if.write_valid) begin
             case (dcr_bus_if.write_addr)
                 `VX_DCR_CHECKER_ENABLE:
                     checker_armed            <= dcr_bus_if.write_data[0];
                 `VX_DCR_CHECKER_TAP_ADDR0:
                     checker_tap_addr[31:0]                  <= dcr_bus_if.write_data;
             `ifdef XLEN_64
-                // MEM_ADDR_WIDTH=48 for XLEN_64; upper 16 bits come from low 16 of write_data.
+                // MEM_ADDR_WIDTH=48 for XLEN_64; upper 16 bits from low 16 of write_data.
                 `VX_DCR_CHECKER_TAP_ADDR1:
                     checker_tap_addr[`MEM_ADDR_WIDTH-1:32]  <= (`MEM_ADDR_WIDTH-32)'(dcr_bus_if.write_data);
             `endif
