@@ -6,13 +6,8 @@ void kernel_body(kernel_arg_t* __UNIFORM__ arg) {
     auto dst = reinterpret_cast<float*>(arg->dst_addr);
     uint32_t N = arg->num_elems;
 
-    // Fire the checker trigger.
-    // ADDI x0, x0, 2047 is a true architectural NOP (rd=x0 discards the result)
-    // with a unique immediate that the RTL checker watches for on the fetch bus.
-    asm volatile("addi x0, x0, 2047");
-
-    // Read the entire src buffer. Each load here should appear in the checker's
-    // tap-load trace if the RTL TAP_ADDR/TAP_LEN parameters cover src_addr.
+    // Read the entire src buffer. The checker is armed by the host via DCR
+    // before kernel launch — no trigger instruction needed here.
     float sum = 0.0f;
     for (uint32_t i = 0; i < N; ++i) {
         sum += src[i];

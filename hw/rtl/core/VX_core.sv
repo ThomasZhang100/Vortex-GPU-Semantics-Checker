@@ -41,12 +41,6 @@ module VX_core import VX_gpu_pkg::*; #(
     VX_gbar_bus_if.master   gbar_bus_if,
 `endif
 
-`ifdef CHECKER_ENABLE
-    // Pulsed for one cycle when the trigger instruction is fetched.
-    // Only used externally when this is global core 0.
-    output wire             trigger_out,
-`endif
-
     // Status
     output wire             busy
 );
@@ -295,15 +289,5 @@ module VX_core import VX_gpu_pkg::*; #(
 
 `endif
 
-`ifdef CHECKER_ENABLE
-    // Pulse trigger_out for one cycle when the trigger instruction is fetched.
-    // The instruction encoding (ADDI x0,x0,2047 = 32'h7FF00013) can be
-    // overridden with -DTRIGGER_INSTR=<decimal> in CONFIGS.
-    `ifndef TRIGGER_INSTR
-    `define TRIGGER_INSTR 32'h7FF00013
-    `endif
-    assign trigger_out = fetch_if.valid && fetch_if.ready
-                      && (fetch_if.data.instr == `TRIGGER_INSTR);
-`endif
 
 endmodule

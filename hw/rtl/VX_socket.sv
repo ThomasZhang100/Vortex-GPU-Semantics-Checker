@@ -38,11 +38,6 @@ module VX_socket import VX_gpu_pkg::*; #(
     VX_gbar_bus_if.master   gbar_bus_if,
 `endif
 
-`ifdef CHECKER_ENABLE
-    // Trigger from core 0 of socket 0 only; other sockets drive 0.
-    output wire             trigger_out,
-`endif
-
     // Status
     output wire             busy
 );
@@ -219,12 +214,6 @@ module VX_socket import VX_gpu_pkg::*; #(
 
     ///////////////////////////////////////////////////////////////////////////
 
-`ifdef CHECKER_ENABLE
-    wire [`SOCKET_SIZE-1:0] per_core_trigger;
-    // Expose trigger only from the first core of socket 0 (= global core 0).
-    assign trigger_out = (SOCKET_ID == 0) ? per_core_trigger[0] : 1'b0;
-`endif
-
     wire [`SOCKET_SIZE-1:0] per_core_busy;
 
     // Generate all cores
@@ -256,10 +245,6 @@ module VX_socket import VX_gpu_pkg::*; #(
 
         `ifdef GBAR_ENABLE
             .gbar_bus_if    (per_core_gbar_bus_if[core_id]),
-        `endif
-
-        `ifdef CHECKER_ENABLE
-            .trigger_out    (per_core_trigger[core_id]),
         `endif
 
             .busy           (per_core_busy[core_id])

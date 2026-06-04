@@ -3,6 +3,7 @@
 #include <cmath>
 #include <unistd.h>
 #include <vortex.h>
+#include <VX_types.h>
 #include "common.h"
 
 #define RT_CHECK(_expr)                                          \
@@ -65,12 +66,8 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_mem_address(dst_buffer, &kernel_arg.dst_addr));
     kernel_arg.num_elems = num_elems;
 
-    // Print the device address of the src buffer.
-    // This is the value you need to set as TAP_ADDR in VX_core.sv (or via CONFIGS)
-    // if it does not match the current hardcoded default (0x20000000).
     printf("src (hidden-state) device addr = 0x%lx  size = %u bytes\n",
            (unsigned long)kernel_arg.src_addr, src_size);
-    printf("TAP_ADDR in RTL is hardcoded to 0x20000000 — update if these differ.\n");
 
     // Fill src with known values: src[i] = (float)(i+1)
     std::vector<float> h_src(num_elems);
@@ -83,6 +80,20 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_copy_to_dev(src_buffer, h_src.data(), 0, src_size));
     RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
     RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
+
+    // Arm the checker before launching the kernel.
+    // The DCR writes happen in the deployer's trusted window — before vx_start,
+    // so inference software never runs until all three registers are set.
+    printf("Arming checker: tap_addr=0x%lx  tap_len=%u\n",
+           (unsigned long)kernel_arg.src_addr, src_size);
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
+                          (uint32_t)(kernel_arg.src_addr & 0xFFFFFFFF)));
+#ifdef XLEN_64
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
+                          (uint32_t)(kernel_arg.src_addr >> 32)));
+#endif
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_LEN, src_size));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, 1));
 
     printf("Launching kernel (num_elems=%u, expected_sum=%.1f)\n",
            num_elems, expected_sum);
