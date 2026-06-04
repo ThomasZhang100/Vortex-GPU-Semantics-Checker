@@ -162,6 +162,15 @@ module VX_cluster import VX_gpu_pkg::*; #(
     logic [`MEM_ADDR_WIDTH-1:0] checker_tap_addr;
     logic [`MEM_ADDR_WIDTH-1:0] checker_tap_len;
 
+    // Initialize to 0 — these registers have no synchronous reset (by design,
+    // so values survive processor::run()'s reset pulse), so initial block is
+    // the only way to give them a known starting value in simulation.
+    initial begin
+        checker_armed    = 0;
+        checker_tap_addr = 0;
+        checker_tap_len  = 0;
+    end
+
     // No reset condition — mirrors VX_dcr_data.sv (which uses UNUSED_VAR(reset)).
     // DCR values written before vx_start must survive the RTL reset pulse inside
     // processor::run(), so this register intentionally ignores reset.
@@ -187,7 +196,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     end
 
     // Debug: confirm checker_armed is high when the kernel starts.
-    logic checker_armed_seen;
+    logic checker_armed_seen = 0;
     always @(posedge clk) begin
         if (!checker_armed_seen && checker_armed) begin
             checker_armed_seen <= 1;
