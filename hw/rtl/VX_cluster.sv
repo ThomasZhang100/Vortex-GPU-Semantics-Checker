@@ -167,6 +167,8 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // processor::run(), so this register intentionally ignores reset.
     always @(posedge clk) begin
         if (dcr_bus_if.write_valid) begin
+            `TRACE(3, ("%t: [CLUSTER-DCR] write addr=0x%0h data=0x%0h\n",
+                $time, dcr_bus_if.write_addr, dcr_bus_if.write_data))
             case (dcr_bus_if.write_addr)
                 `VX_DCR_CHECKER_ENABLE:
                     checker_armed            <= dcr_bus_if.write_data[0];
@@ -181,6 +183,16 @@ module VX_cluster import VX_gpu_pkg::*; #(
                     checker_tap_len <= `MEM_ADDR_WIDTH'(dcr_bus_if.write_data);
                 default:;
             endcase
+        end
+    end
+
+    // Debug: confirm checker_armed is high when the kernel starts.
+    logic checker_armed_seen;
+    always @(posedge clk) begin
+        if (!checker_armed_seen && checker_armed) begin
+            checker_armed_seen <= 1;
+            `TRACE(3, ("%t: [CLUSTER-CHK] checker_armed went HIGH tap=0x%0h len=0x%0h\n",
+                $time, checker_tap_addr, checker_tap_len))
         end
     end
 
