@@ -110,8 +110,10 @@
 `define NUM_BARRIERS `UP(`NUM_WARPS/2)
 `endif
 
+// NVIDIA-like hierarchy: Socket = SM (Streaming Multiprocessor)
+// Each socket has SOCKET_SIZE cores sharing L1 D$ and L2
 `ifndef SOCKET_SIZE
-`define SOCKET_SIZE `MIN(4, `NUM_CORES)
+`define SOCKET_SIZE `NUM_CORES  // All cores in one socket (like 1 SM)
 `endif
 
 `ifdef L1_DISABLE
@@ -593,9 +595,9 @@
     `define DCACHE_NUM_BANKS 1
 `endif
 
-// Number of Cache Units
+// Number of Cache Units (NVIDIA-like: 1 L1 D$ per socket/SM)
 `ifndef NUM_DCACHES
-`define NUM_DCACHES `UP(`SOCKET_SIZE / 4)
+`define NUM_DCACHES 1  // One L1 D$ per socket (shared by all cores in socket)
 `endif
 
 // Cache Size
@@ -709,9 +711,9 @@
 `define L2_NUM_WAYS 8
 `endif
 
-// Enable Cache Writeback
+// Enable Cache Writeback (NVIDIA model: L2 is WRITE-BACK to DRAM)
 `ifndef L2_WRITEBACK
-`define L2_WRITEBACK 0
+`define L2_WRITEBACK 1  // Write-back to DRAM (accumulates stores, batches writes)
 `endif
 
 // Enable Cache Dirty bytes
@@ -734,6 +736,10 @@
 `endif
 
 // L3cache Configurable Knobs /////////////////////////////////////////////////
+// NVIDIA model: NO L3 cache (only L1 + L2)
+
+// Disable L3 to match NVIDIA GPU hierarchy
+`define L3_DISABLE
 
 // Cache Size
 `ifndef L3_CACHE_SIZE
