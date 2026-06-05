@@ -738,8 +738,8 @@
 // L3cache Configurable Knobs /////////////////////////////////////////////////
 // NVIDIA model: NO L3 cache (only L1 + L2)
 
-// Disable L3 to match NVIDIA GPU hierarchy
-`define L3_DISABLE
+// Comment out L3_ENABLE to disable L3
+// `define L3_ENABLE  // Commented out for NVIDIA-like 2-level hierarchy
 
 // Cache Size
 `ifndef L3_CACHE_SIZE
