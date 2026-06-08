@@ -8,10 +8,13 @@
 // FIFO: each row holds FIFO_DEPTH=64 FP16 elements (2 cache lines).  A cache-
 // line response pushes 32 elements; the dummy consumer pops 1 per cycle.
 //
-// Skew: row b starts consuming only after its first cache line arrives.
-// Because loads are issued in order (row 0 first, then 1, 2, 3), L2 latency
-// is symmetric, so row b's FIFO fills ~b cycles later than row 0.  This
-// naturally provides the diagonal input skew a systolic array requires.
+// Skewed/wavefront activation: row 0 starts consuming when its FIFO first
+// has data; row b starts exactly 1 cycle after row b-1.  This produces the
+// 1-cycle activation stagger a systolic array requires: at cycle t, row b
+// is processing k = t - b.
+//
+// Global stall: if ANY started row's FIFO runs empty, all started rows stall
+// together so the fixed inter-row skew is never disturbed.
 //
 // Weights: private SRAM (placeholder, not yet implemented).
 // Systolic array: placeholder (dummy consume only).
@@ -88,14 +91,27 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Per-row prefetch state
     logic [B_TILE-1:0][CHUNKS_W-1:0] next_chunk;   // next cache line to prefetch
 
-    // Skew gate: row b starts consuming after its first cache line arrives
-    logic [B_TILE-1:0] skew_done;
-
     // -------------------------------------------------------------------------
     // Response routing
     // -------------------------------------------------------------------------
     wire rsp_fire = act_bus_if.rsp_valid && act_bus_if.rsp_ready;
     wire [ROW_ID_BITS-1:0] rsp_row = act_bus_if.rsp_data.tag.value[ROW_ID_BITS-1:0];
+
+    // -------------------------------------------------------------------------
+    // Per-row start flags and global stall
+    // -------------------------------------------------------------------------
+    logic [B_TILE-1:0] k_started;
+
+    // Stall ALL started rows if any started row's FIFO is empty.
+    // This preserves the fixed 1-cycle inter-row skew across stalls.
+    logic k_stall;
+    always_comb begin
+        k_stall = 1'b0;
+        for (int b = 0; b < B_TILE; b++) begin
+            if (k_started[b] && (count[b] == '0))
+                k_stall = 1'b1;
+        end
+    end
 
     // -------------------------------------------------------------------------
     // Push / pop combinational helpers
@@ -104,8 +120,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_comb begin
         for (int b = 0; b < B_TILE; b++) begin
             row_push[b] = rsp_fire && (ROW_ID_BITS'(rsp_row) == ROW_ID_BITS'(b));
-            // Dummy consume: drain when skew gate is open and FIFO has data
-            row_pop[b]  = (state == ACTIVE) && skew_done[b] && (count[b] > 0);
+            // Row b drains when it has started; all stall together when any is empty
+            row_pop[b]  = k_started[b] && !k_stall;
         end
     end
 
@@ -119,13 +135,17 @@ module VX_checker import VX_gpu_pkg::*; #(
                 wr_ptr[b]  <= '0;
                 count[b]   <= '0;
             end
-            skew_done <= '0;
+            k_started <= '0;
             state     <= IDLE;
             if (rearm) state <= ACTIVE;
         end else if (state == ACTIVE) begin
-            // Skew gate: arms permanently once first data arrives for that row
-            for (int b = 0; b < B_TILE; b++) begin
-                if (row_push[b]) skew_done[b] <= 1;
+            // Row 0: start as soon as its FIFO has any data
+            if (!k_started[0] && (count[0] > '0))
+                k_started[0] <= 1'b1;
+            // Row b: start exactly 1 cycle after row b-1 (1-cycle activation skew)
+            for (int b = 1; b < B_TILE; b++) begin
+                if (!k_started[b] && k_started[b-1])
+                    k_started[b] <= 1'b1;
             end
 
             for (int b = 0; b < B_TILE; b++) begin
@@ -240,6 +260,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                     $time, rsp_row,
                     act_bus_if.rsp_data.data[15:0],
                     count[rsp_row] + (row_pop[rsp_row] ? FIFO_CTR_W'(LINE_WORDS)-1 : FIFO_CTR_W'(LINE_WORDS))))
+            if (k_stall)
+                `TRACE(3, ("%t: [CHECKER] stall  k_started=%0b\n", $time, k_started))
             for (int b = 0; b < B_TILE; b++) begin
                 if (row_pop[b])
                     `TRACE(3, ("%t: [CHECKER] pop  row=%0d  k=%0d  fp16=0x%0h\n",
