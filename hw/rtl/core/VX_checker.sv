@@ -26,7 +26,6 @@
 
 module VX_checker import VX_gpu_pkg::*; #(
     parameter B_TILE     = 4,               // rows  (tokens per batch, fixed)
-    parameter N_TILE     = 16,              // cols  (SAE features, fixed)
     parameter FIFO_DEPTH = 64,              // FP16 slots per row  (2 cache lines)
     parameter LINE_WORDS = `L1_LINE_SIZE/2  // FP16 values per cache line (64B/2B=32)
 ) (
@@ -76,7 +75,7 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     always_ff @(posedge clk) begin
         if (rearm)
-            total_chunks <= CHUNKS_W'((hidden_size + LINE_WORDS - 1) >> LOG_LW);
+            total_chunks <= CHUNKS_W'((32'(hidden_size) + LINE_WORDS - 1) >> LOG_LW);
     end
 
     // -------------------------------------------------------------------------
@@ -143,16 +142,16 @@ module VX_checker import VX_gpu_pkg::*; #(
                 // --- Pop: dummy consume 1 element (systolic array hook) ---
                 if (row_pop[b]) begin
                     // TODO: expose fifo[b][rd_ptr[b]] to systolic array row b
-                    rd_ptr[b] <= FIFO_PTR_W'(rd_ptr[b] + 1);
+                    rd_ptr[b] <= rd_ptr[b] + FIFO_PTR_W'(1);
                 end
 
                 // --- Count: handle simultaneous push + pop ---
                 if (row_push[b] && row_pop[b])
-                    count[b] <= FIFO_CTR_W'(count[b] + FIFO_CTR_W'(LINE_WORDS) - 1);
+                    count[b] <= FIFO_CTR_W'(count[b]) + FIFO_CTR_W'(LINE_WORDS) - FIFO_CTR_W'(1);
                 else if (row_push[b])
                     count[b] <= FIFO_CTR_W'(count[b] + FIFO_CTR_W'(LINE_WORDS));
                 else if (row_pop[b])
-                    count[b] <= FIFO_CTR_W'(count[b] - 1);
+                    count[b] <= count[b] - FIFO_CTR_W'(1);
             end
         end
     end
@@ -188,8 +187,8 @@ module VX_checker import VX_gpu_pkg::*; #(
         if (reset || rearm) begin
             issue_rr <= '0;
         end else if (req_fire) begin
-            next_chunk[issue_row] <= next_chunk[issue_row] + 1;
-            issue_rr              <= ROW_ID_BITS'(issue_rr + 1);
+            next_chunk[issue_row] <= next_chunk[issue_row] + CHUNKS_W'(1);
+            issue_rr              <= issue_rr + ROW_ID_BITS'(1);
         end
     end
 
