@@ -830,8 +830,12 @@ package VX_gpu_pkg;
     // Word size in bytes
     localparam L2_WORD_SIZE	        = `L1_LINE_SIZE;
 
-    // Input request size
+    // Input request size (+1 for checker's dedicated L2 port when enabled)
+`ifdef CHECKER_ENABLE
+    localparam L2_NUM_REQS          = NUM_SOCKETS * `L1_MEM_PORTS + 1;
+`else
     localparam L2_NUM_REQS	        = NUM_SOCKETS * `L1_MEM_PORTS;
+`endif
 
     // Core request tag bits
     localparam L2_TAG_WIDTH	        = L1_MEM_ARB_TAG_WIDTH;

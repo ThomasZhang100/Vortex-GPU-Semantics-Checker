@@ -81,6 +81,17 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .TAG_WIDTH (L1_MEM_ARB_TAG_WIDTH)
     ) per_socket_mem_bus_if[NUM_SOCKETS * `L1_MEM_PORTS]();
 
+    // Combined L2 core bus: socket ports [0..N-1], checker port [N] (CHECKER_ENABLE only).
+    // L2_NUM_REQS == NUM_SOCKETS*L1_MEM_PORTS without CHECKER_ENABLE, so size is unchanged.
+    VX_mem_bus_if #(
+        .DATA_SIZE (`L1_LINE_SIZE),
+        .TAG_WIDTH (L1_MEM_ARB_TAG_WIDTH)
+    ) l2_core_bus_if[L2_NUM_REQS]();
+
+    for (genvar p = 0; p < NUM_SOCKETS * `L1_MEM_PORTS; ++p) begin : g_l2_sock
+        `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[p], per_socket_mem_bus_if[p]);
+    end
+
     `RESET_RELAY (l2_reset, reset);
 
     VX_cache_wrap #(
@@ -111,7 +122,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     `ifdef PERF_ENABLE
         .cache_perf     (l2_perf),
     `endif
-        .core_bus_if    (per_socket_mem_bus_if),
+        .core_bus_if    (l2_core_bus_if),
         .mem_bus_if     (mem_bus_if)
     );
 
@@ -157,72 +168,56 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
 `ifdef CHECKER_ENABLE
     // DCR latch: captures VX_DCR_CHECKER_* writes from the host before vx_start.
-    // dcr_bus_if is visible here (unfiltered) before being forwarded to sockets.
-    logic                       checker_armed;
-    logic [`MEM_ADDR_WIDTH-1:0] checker_tap_addr;
-    logic [`MEM_ADDR_WIDTH-1:0] checker_tap_len;
+    // Intentionally has no synchronous reset so values survive processor::run()'s
+    // reset pulse (same pattern as VX_dcr_data.sv).
+    logic                        checker_armed;
+    logic [`MEM_ADDR_WIDTH-1:0]  checker_hidden_base_addr;
+    logic [15:0]                 checker_hidden_size;
+    logic [3:0]                  checker_batch_size;
 
-    // Initialize to 0 — these registers have no synchronous reset (by design,
-    // so values survive processor::run()'s reset pulse), so initial block is
-    // the only way to give them a known starting value in simulation.
     initial begin
-        checker_armed    = 0;
-        checker_tap_addr = 0;
-        checker_tap_len  = 0;
+        checker_armed            = 0;
+        checker_hidden_base_addr = 0;
+        checker_hidden_size      = 0;
+        checker_batch_size       = 0;
     end
 
-    // No reset condition — mirrors VX_dcr_data.sv (which uses UNUSED_VAR(reset)).
-    // DCR values written before vx_start must survive the RTL reset pulse inside
-    // processor::run(), so this register intentionally ignores reset.
     always @(posedge clk) begin
         if (dcr_bus_if.write_valid) begin
             case (dcr_bus_if.write_addr)
                 `VX_DCR_CHECKER_ENABLE:
-                    checker_armed            <= dcr_bus_if.write_data[0];
+                    checker_armed                               <= dcr_bus_if.write_data[0];
                 `VX_DCR_CHECKER_TAP_ADDR0:
-                    checker_tap_addr[31:0]                  <= dcr_bus_if.write_data;
+                    checker_hidden_base_addr[31:0]              <= dcr_bus_if.write_data;
             `ifdef XLEN_64
-                // MEM_ADDR_WIDTH=48 for XLEN_64; upper 16 bits from low 16 of write_data.
                 `VX_DCR_CHECKER_TAP_ADDR1:
-                    checker_tap_addr[`MEM_ADDR_WIDTH-1:32]  <= (`MEM_ADDR_WIDTH-32)'(dcr_bus_if.write_data);
+                    checker_hidden_base_addr[`MEM_ADDR_WIDTH-1:32] <= (`MEM_ADDR_WIDTH-32)'(dcr_bus_if.write_data);
             `endif
-                `VX_DCR_CHECKER_TAP_LEN:
-                    checker_tap_len <= `MEM_ADDR_WIDTH'(dcr_bus_if.write_data);
+                `VX_DCR_CHECKER_HIDDEN_SIZE:
+                    checker_hidden_size                         <= dcr_bus_if.write_data[15:0];
+                `VX_DCR_CHECKER_BATCH_SIZE:
+                    checker_batch_size                          <= dcr_bus_if.write_data[3:0];
                 default:;
             endcase
         end
     end
 
-    // Flatten all L1→L2 bus signals for the checker.
-    localparam integer CHK_NUM_PORTS = NUM_SOCKETS * `L1_MEM_PORTS;
-    localparam integer CHK_LINE_BITS = `CLOG2(`L1_LINE_SIZE);
-    localparam integer CHK_ADDR_W   = `MEM_ADDR_WIDTH - CHK_LINE_BITS;
+    // Checker's dedicated L2 port (wired into l2_core_bus_if at slot N)
+    VX_mem_bus_if #(
+        .DATA_SIZE (`L1_LINE_SIZE),
+        .TAG_WIDTH (L1_MEM_ARB_TAG_WIDTH)
+    ) chk_act_bus_if();
 
-    wire [CHK_NUM_PORTS-1:0]                      chk_req_valid;
-    wire [CHK_NUM_PORTS-1:0]                      chk_req_rw;
-    wire [CHK_NUM_PORTS-1:0][CHK_ADDR_W-1:0]     chk_req_addr;
-    wire [CHK_NUM_PORTS-1:0]                      chk_rsp_valid;
-    wire [CHK_NUM_PORTS-1:0][`L1_LINE_SIZE*8-1:0] chk_rsp_data;
-
-    for (genvar p = 0; p < CHK_NUM_PORTS; ++p) begin : g_chk_ports
-        assign chk_req_valid[p] = per_socket_mem_bus_if[p].req_valid;
-        assign chk_req_rw[p]    = per_socket_mem_bus_if[p].req_data.rw;
-        assign chk_req_addr[p]  = per_socket_mem_bus_if[p].req_data.addr;
-        assign chk_rsp_valid[p] = per_socket_mem_bus_if[p].rsp_valid;
-        assign chk_rsp_data[p]  = per_socket_mem_bus_if[p].rsp_data.data;
-    end
+    `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[NUM_SOCKETS * `L1_MEM_PORTS], chk_act_bus_if);
 
     VX_checker sem_checker (
-        .clk           (clk),
-        .reset         (reset),
-        .checker_armed (checker_armed),
-        .tap_addr      (checker_tap_addr),
-        .tap_len       (checker_tap_len),
-        .mem_req_valid (chk_req_valid),
-        .mem_req_rw    (chk_req_rw),
-        .mem_req_addr  (chk_req_addr),
-        .mem_rsp_valid (chk_rsp_valid),
-        .mem_rsp_data  (chk_rsp_data)
+        .clk              (clk),
+        .reset            (reset),
+        .checker_armed    (checker_armed),
+        .hidden_base_addr (checker_hidden_base_addr),
+        .hidden_size      (checker_hidden_size),
+        .batch_size       (checker_batch_size),
+        .act_bus_if       (chk_act_bus_if)
     );
 `endif
 

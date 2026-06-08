@@ -28,10 +28,11 @@
 `define VX_DCR_BASE_STATE_END           12'h006
 
 // Semantic checker configuration registers ////////////////////////////////////
-`define VX_DCR_CHECKER_ENABLE           12'h010  // write 1 to arm, 0 to disarm
-`define VX_DCR_CHECKER_TAP_ADDR0        12'h011  // hidden-state byte addr [31:0]
-`define VX_DCR_CHECKER_TAP_ADDR1        12'h012  // hidden-state byte addr [63:32] (XLEN_64)
-`define VX_DCR_CHECKER_TAP_LEN          12'h013  // byte length of hidden-state buffer
+`define VX_DCR_CHECKER_ENABLE           12'h010  // write 1 to arm (rising edge starts streaming)
+`define VX_DCR_CHECKER_TAP_ADDR0        12'h011  // hidden-state base byte addr [31:0]
+`define VX_DCR_CHECKER_TAP_ADDR1        12'h012  // hidden-state base byte addr [63:32] (XLEN_64)
+`define VX_DCR_CHECKER_HIDDEN_SIZE      12'h013  // FP16 elements per token (e.g. 1536)
+`define VX_DCR_CHECKER_BATCH_SIZE       12'h014  // number of tokens in batch (max B_TILE=4)
 
 `define VX_DCR_BASE_STATE(addr)         ((addr) - `VX_DCR_BASE_STATE_BEGIN)
 `define VX_DCR_BASE_STATE_COUNT         (`VX_DCR_BASE_STATE_END-`VX_DCR_BASE_STATE_BEGIN)

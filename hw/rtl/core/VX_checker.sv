@@ -1,143 +1,248 @@
-// Semantic checker — snoops the L1→L2 bus (per_socket_mem_bus_if in VX_cluster).
+// Semantic checker — active-load SAE checker.
 //
-// Activation: deployer writes VX_DCR_CHECKER_ENABLE=1 before vx_start.
-//             checker_armed is a level signal; no kernel modification needed.
+// Activation loading: issues independent load requests through a dedicated L2
+// port (act_bus_if).  Four rows (one per token in the batch) are prefetched in
+// round-robin order; a new prefetch is issued for row b whenever its FIFO drops
+// to half-empty and more chunks remain.
 //
-// Memory tap: assembles all L1→L2 read responses whose cache-line address falls
-//             in [tap_addr, tap_addr+tap_len) into hidden_layer, indexed by
-//             byte offset within the range.  hidden_layer_complete pulses for
-//             one cycle when every expected cache line has arrived.
+// FIFO: each row holds FIFO_DEPTH=64 FP16 elements (2 cache lines).  A cache-
+// line response pushes 32 elements; the dummy consumer pops 1 per cycle.
 //
-// Sizing: MAX_TAP_LINES controls the maximum hidden-state size in cache lines.
-//         Default 128 covers 128 × 64 B = 8 KB (e.g. 2048-dim FP32 hidden state).
+// Skew: row b starts consuming only after its first cache line arrives.
+// Because loads are issued in order (row 0 first, then 1, 2, 3), L2 latency
+// is symmetric, so row b's FIFO fills ~b cycles later than row 0.  This
+// naturally provides the diagonal input skew a systolic array requires.
 //
-// Enable:      -DCHECKER_ENABLE
-// View output: --debug=3 passed to blackbox.sh
+// Weights: private SRAM (placeholder, not yet implemented).
+// Systolic array: placeholder (dummy consume only).
+//
+// Enable: -DCHECKER_ENABLE
+// DCRs:   VX_DCR_CHECKER_ENABLE      (rising edge = start streaming)
+//         VX_DCR_CHECKER_TAP_ADDR0/1 (hidden-state base address)
+//         VX_DCR_CHECKER_HIDDEN_SIZE  (FP16 elements per token)
+//         VX_DCR_CHECKER_BATCH_SIZE   (tokens in batch, max B_TILE)
 
 `include "VX_define.vh"
 
 module VX_checker import VX_gpu_pkg::*; #(
-    parameter integer MAX_TAP_LINES = 128   // max cache lines to capture
+    parameter B_TILE     = 4,               // rows  (tokens per batch, fixed)
+    parameter N_TILE     = 16,              // cols  (SAE features, fixed)
+    parameter FIFO_DEPTH = 64,              // FP16 slots per row  (2 cache lines)
+    parameter LINE_WORDS = `L1_LINE_SIZE/2  // FP16 values per cache line (64B/2B=32)
 ) (
-    input wire clk,
-    input wire reset,
+    input  wire clk,
+    input  wire reset,
 
-    // Deployer-controlled level signal (from VX_DCR_CHECKER_ENABLE DCR).
-    // High = checker is armed.  Rising edge resets the capture state.
-    input wire                         checker_armed,
+    // DCR-supplied config (latched in VX_cluster before vx_start)
+    input  wire                         checker_armed,
+    input  wire [`MEM_ADDR_WIDTH-1:0]   hidden_base_addr,
+    input  wire [15:0]                  hidden_size,   // FP16 elements per token
+    input  wire [3:0]                   batch_size,    // tokens this batch (≤ B_TILE)
 
-    // Runtime tap window (from VX_DCR_CHECKER_TAP_ADDR / TAP_LEN DCRs).
-    input wire [`MEM_ADDR_WIDTH-1:0]   tap_addr,
-    input wire [`MEM_ADDR_WIDTH-1:0]   tap_len,
-
-    // L1→L2 bus snoop: NUM_SOCKETS * L1_MEM_PORTS parallel ports.
-    // Requests carry a cache-line word address (1 unit = L1_LINE_SIZE bytes).
-    // Responses carry L1_LINE_SIZE bytes of data (tag only, no address).
-    input wire [NUM_SOCKETS*`L1_MEM_PORTS-1:0]                        mem_req_valid,
-    input wire [NUM_SOCKETS*`L1_MEM_PORTS-1:0]                        mem_req_rw,
-    input wire [NUM_SOCKETS*`L1_MEM_PORTS-1:0][L1_ADDR_WIDTH-1:0]    mem_req_addr,
-    input wire [NUM_SOCKETS*`L1_MEM_PORTS-1:0]                        mem_rsp_valid,
-    input wire [NUM_SOCKETS*`L1_MEM_PORTS-1:0][`L1_LINE_SIZE*8-1:0]  mem_rsp_data
+    // Dedicated L2 port for activation prefetch
+    VX_mem_bus_if.master                act_bus_if
 );
-    localparam integer LINE_BITS     = `CLOG2(`L1_LINE_SIZE);
-    localparam integer L1_ADDR_WIDTH = `MEM_ADDR_WIDTH - LINE_BITS;
-    localparam integer NUM_PORTS     = NUM_SOCKETS * `L1_MEM_PORTS;
-    localparam integer LINE_CTR_W    = `CLOG2(MAX_TAP_LINES + 1);
+    localparam LINE_BYTES   = `L1_LINE_SIZE;           // 64
+    localparam LINE_BITS    = `CLOG2(LINE_BYTES);      // 6
+    localparam LOG_LW       = `CLOG2(LINE_WORDS);      // log2(32) = 5
+    localparam FIFO_PTR_W   = `CLOG2(FIFO_DEPTH);     // 6
+    localparam FIFO_CTR_W   = `CLOG2(FIFO_DEPTH + 1); // 7
+    localparam FIFO_HALF    = FIFO_DEPTH / 2;          // 32 = issue threshold
+    localparam CHUNKS_W     = 12;                      // enough for ceil(65535/32)
+    localparam ROW_ID_BITS  = `CLOG2(B_TILE);          // 2
 
-    // Dynamic cache-line address range derived from DCR-supplied byte addresses.
-    wire [L1_ADDR_WIDTH-1:0] tap_line_lo = L1_ADDR_WIDTH'(tap_addr >> LINE_BITS);
-    wire [L1_ADDR_WIDTH-1:0] tap_line_hi = L1_ADDR_WIDTH'((tap_addr + tap_len - 1) >> LINE_BITS);
-    wire [LINE_CTR_W-1:0]    tap_lines   = LINE_CTR_W'(tap_line_hi - tap_line_lo) + 1'b1;
+    localparam TAG_VAL_W = L2_TAG_WIDTH - `UP(UUID_WIDTH); // value field width
 
-    // Detect rising edge of checker_armed to reset capture state between tokens.
-    logic checker_armed_r;
-    always @(posedge clk) begin
-        if (reset) checker_armed_r <= 0;
-        else       checker_armed_r <= checker_armed;
+    // -------------------------------------------------------------------------
+    // Rising-edge detector for checker_armed
+    // -------------------------------------------------------------------------
+    logic armed_r;
+    always_ff @(posedge clk) begin
+        if (reset) armed_r <= 0;
+        else       armed_r <= checker_armed;
     end
-    wire rearm = checker_armed && !checker_armed_r;
+    wire rearm = checker_armed && !armed_r;
 
-    // Assembled hidden layer — MAX_TAP_LINES × L1_LINE_SIZE bytes.
-    // Slot k holds the cache line at byte offset k*L1_LINE_SIZE from tap_addr.
-    /* verilator lint_off UNUSEDSIGNAL */
-    logic [MAX_TAP_LINES*`L1_LINE_SIZE*8-1:0] hidden_layer;
-    /* verilator lint_on UNUSEDSIGNAL */
+    // -------------------------------------------------------------------------
+    // State
+    // -------------------------------------------------------------------------
+    typedef enum logic { IDLE = 1'b0, ACTIVE = 1'b1 } state_t;
+    state_t state;
 
-    // Counter of distinct cache lines received so far this capture.
-    logic [LINE_CTR_W-1:0] lines_received_count;
+    // -------------------------------------------------------------------------
+    // Configuration latched on rearm
+    // -------------------------------------------------------------------------
+    logic [CHUNKS_W-1:0] total_chunks; // ceil(hidden_size / LINE_WORDS)
 
-    wire hidden_layer_full = checker_armed && (lines_received_count == tap_lines);
-
-    // Edge-detect: pulse for exactly one cycle when the last line arrives.
-    logic hidden_layer_full_r;
-    always @(posedge clk) begin
-        if (reset) hidden_layer_full_r <= 0;
-        else       hidden_layer_full_r <= hidden_layer_full;
+    always_ff @(posedge clk) begin
+        if (rearm)
+            total_chunks <= CHUNKS_W'((hidden_size + LINE_WORDS - 1) >> LOG_LW);
     end
-    wire hidden_layer_complete = hidden_layer_full && !hidden_layer_full_r;
 
-    // Per-port: remember the address of an outstanding tap-range read so that
-    // when the response arrives (tag only, no address) we can slot it correctly.
-    logic [NUM_PORTS-1:0]                    pending;
-    logic [NUM_PORTS-1:0][L1_ADDR_WIDTH-1:0] pending_addr;
+    // -------------------------------------------------------------------------
+    // Per-row FIFO storage
+    // -------------------------------------------------------------------------
+    logic [B_TILE-1:0][FIFO_DEPTH-1:0][15:0] fifo;
+    logic [B_TILE-1:0][FIFO_PTR_W-1:0]       rd_ptr, wr_ptr;
+    logic [B_TILE-1:0][FIFO_CTR_W-1:0]       count;
 
-    always @(posedge clk) begin
+    // Per-row prefetch state
+    logic [B_TILE-1:0][CHUNKS_W-1:0] next_chunk;   // next cache line to prefetch
+
+    // Skew gate: row b starts consuming after its first cache line arrives
+    logic [B_TILE-1:0] skew_done;
+
+    // -------------------------------------------------------------------------
+    // Response routing
+    // -------------------------------------------------------------------------
+    wire rsp_fire = act_bus_if.rsp_valid && act_bus_if.rsp_ready;
+    wire [ROW_ID_BITS-1:0] rsp_row = act_bus_if.rsp_data.tag.value[ROW_ID_BITS-1:0];
+
+    // -------------------------------------------------------------------------
+    // Push / pop combinational helpers
+    // -------------------------------------------------------------------------
+    logic [B_TILE-1:0] row_push, row_pop;
+    always_comb begin
+        for (int b = 0; b < B_TILE; b++) begin
+            row_push[b] = rsp_fire && (ROW_ID_BITS'(rsp_row) == ROW_ID_BITS'(b));
+            // Dummy consume: drain when skew gate is open and FIFO has data
+            row_pop[b]  = (state == ACTIVE) && skew_done[b] && (count[b] > 0);
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // FIFO update (push 32 / pop 1 per row per cycle)
+    // -------------------------------------------------------------------------
+    always_ff @(posedge clk) begin
         if (reset || rearm) begin
-            /* verilator lint_off WIDTHCONCAT */
-            hidden_layer         <= '0;
-            /* verilator lint_on WIDTHCONCAT */
-            lines_received_count <= '0;
-            pending              <= '0;
-            pending_addr         <= '0;
-        end else begin
-            for (integer i = 0; i < NUM_PORTS; ++i) begin
-                // Arm pending when a read request to the tap range is issued.
-                if (mem_req_valid[i] && !mem_req_rw[i]
-                        && mem_req_addr[i] >= tap_line_lo
-                        && mem_req_addr[i] <= tap_line_hi) begin
-                    pending[i]      <= 1;
-                    pending_addr[i] <= mem_req_addr[i];
+            for (int b = 0; b < B_TILE; b++) begin
+                rd_ptr[b]     <= '0;
+                wr_ptr[b]     <= '0;
+                count[b]      <= '0;
+                next_chunk[b] <= '0;
+            end
+            skew_done <= '0;
+            state     <= IDLE;
+            if (rearm) state <= ACTIVE;
+        end else if (state == ACTIVE) begin
+            // Skew gate: arms permanently once first data arrives for that row
+            for (int b = 0; b < B_TILE; b++) begin
+                if (row_push[b]) skew_done[b] <= 1;
+            end
+
+            for (int b = 0; b < B_TILE; b++) begin
+                // --- Push: write LINE_WORDS elements at wr_ptr ---
+                if (row_push[b]) begin
+                    for (int w = 0; w < LINE_WORDS; w++) begin
+                        fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w))]
+                            <= act_bus_if.rsp_data.data[w*16 +: 16];
+                    end
+                    wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
                 end
-                // On response: write into the correct hidden_layer slot.
-                if (mem_rsp_valid[i] && pending[i]) begin
-                    automatic integer line_idx;
-                    line_idx = integer'(pending_addr[i]) - integer'(tap_line_lo);
-                    hidden_layer[line_idx*`L1_LINE_SIZE*8 +: `L1_LINE_SIZE*8]
-                        <= mem_rsp_data[i];
-                    lines_received_count <= lines_received_count + 1'b1;
-                    pending[i] <= 0;
+
+                // --- Pop: dummy consume 1 element (systolic array hook) ---
+                if (row_pop[b]) begin
+                    // TODO: expose fifo[b][rd_ptr[b]] to systolic array row b
+                    rd_ptr[b] <= FIFO_PTR_W'(rd_ptr[b] + 1);
                 end
+
+                // --- Count: handle simultaneous push + pop ---
+                if (row_push[b] && row_pop[b])
+                    count[b] <= FIFO_CTR_W'(count[b] + FIFO_CTR_W'(LINE_WORDS) - 1);
+                else if (row_push[b])
+                    count[b] <= FIFO_CTR_W'(count[b] + FIFO_CTR_W'(LINE_WORDS));
+                else if (row_pop[b])
+                    count[b] <= FIFO_CTR_W'(count[b] - 1);
             end
         end
     end
 
-    always @(posedge clk) begin
-        if (!reset) begin
-            if (rearm) begin
-                `TRACE(3, ("%t: [CHECKER] armed  tap=[0x%0h, 0x%0h)  lines=%0d\n",
-                    $time, tap_addr, tap_addr + tap_len, tap_lines))
-            end
-            for (integer i = 0; i < NUM_PORTS; ++i) begin
-                if (checker_armed && mem_req_valid[i] && !mem_req_rw[i]
-                        && mem_req_addr[i] >= tap_line_lo
-                        && mem_req_addr[i] <= tap_line_hi) begin
-                    `TRACE(3, ("%t: [CHECKER] tap req  port=%0d line_idx=%0d byte=0x%0h\n",
-                        $time, i,
-                        integer'(mem_req_addr[i]) - integer'(tap_line_lo),
-                        `MEM_ADDR_WIDTH'(mem_req_addr[i]) << LINE_BITS))
-                end
-                if (checker_armed && mem_rsp_valid[i] && pending[i]) begin
-                    automatic integer line_idx;
-                    line_idx = integer'(pending_addr[i]) - integer'(tap_line_lo);
-                    `TRACE(3, ("%t: [CHECKER] tap rsp  port=%0d line_idx=%0d data[63:0]=0x%0h\n",
-                        $time, i, line_idx, mem_rsp_data[i][63:0]))
-                end
-            end
-            if (hidden_layer_complete) begin
-                `TRACE(3, ("%t: [CHECKER] hidden_layer complete  lines=%0d  [63:0]=0x%0h\n",
-                    $time, lines_received_count, hidden_layer[63:0]))
+    // -------------------------------------------------------------------------
+    // Issue FSM: round-robin across rows, issue when FIFO half-empty
+    // -------------------------------------------------------------------------
+    logic [ROW_ID_BITS-1:0] issue_rr;   // round-robin base
+
+    // Combinational: find next row needing a prefetch (starting from issue_rr)
+    logic [ROW_ID_BITS-1:0] issue_row;
+    logic                   issue_valid;
+
+    always_comb begin
+        issue_row   = '0;
+        issue_valid = 1'b0;
+        for (int i = 0; i < B_TILE; i++) begin
+            automatic int bi = (int'(issue_rr) + i) % B_TILE;
+            if (!issue_valid
+                    && (state == ACTIVE)
+                    && (count[bi] <= FIFO_CTR_W'(FIFO_HALF))
+                    && (next_chunk[bi] < total_chunks)) begin
+                issue_row   = ROW_ID_BITS'(bi);
+                issue_valid = 1'b1;
             end
         end
     end
+
+    // Advance round-robin and chunk counter when a request fires
+    wire req_fire = act_bus_if.req_valid && act_bus_if.req_ready;
+
+    always_ff @(posedge clk) begin
+        if (reset || rearm) begin
+            issue_rr <= '0;
+        end else if (req_fire) begin
+            next_chunk[issue_row] <= next_chunk[issue_row] + 1;
+            issue_rr              <= ROW_ID_BITS'(issue_rr + 1);
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Request address calculation
+    // token b starts at: hidden_base_addr + b * hidden_size * 2
+    // chunk c within token b: offset += c * LINE_BYTES
+    // -------------------------------------------------------------------------
+    wire [`MEM_ADDR_WIDTH-1:0] req_byte_addr =
+          hidden_base_addr
+        + (`MEM_ADDR_WIDTH'(issue_row)              * `MEM_ADDR_WIDTH'(hidden_size) * 2)
+        + (`MEM_ADDR_WIDTH'(next_chunk[issue_row])  * LINE_BYTES);
+
+    // -------------------------------------------------------------------------
+    // Drive act_bus_if
+    // -------------------------------------------------------------------------
+    assign act_bus_if.req_valid            = issue_valid;
+    assign act_bus_if.req_data.rw          = 1'b0;             // load
+    assign act_bus_if.req_data.addr        = req_byte_addr[`MEM_ADDR_WIDTH-1:LINE_BITS];
+    assign act_bus_if.req_data.data        = '0;
+    assign act_bus_if.req_data.byteen      = '1;
+    assign act_bus_if.req_data.flags       = '0;
+    assign act_bus_if.req_data.tag.uuid    = '0;
+    // Lower ROW_ID_BITS of value encode the row; upper bits zero
+    assign act_bus_if.req_data.tag.value   = TAG_VAL_W'(issue_row);
+
+    assign act_bus_if.rsp_ready = 1'b1;   // always accept responses
+
+    // -------------------------------------------------------------------------
+    // Simulation traces
+    // -------------------------------------------------------------------------
+`ifdef SIMULATION
+    always @(posedge clk) begin
+        if (!reset && checker_armed) begin
+            if (rearm)
+                `TRACE(3, ("%t: [CHECKER] armed  base=0x%0h  hidden_size=%0d  batch=%0d  chunks=%0d\n",
+                    $time, hidden_base_addr, hidden_size, batch_size, total_chunks))
+            if (req_fire)
+                `TRACE(3, ("%t: [CHECKER] req  row=%0d  chunk=%0d  addr=0x%0h\n",
+                    $time, issue_row, next_chunk[issue_row],
+                    req_byte_addr))
+            if (rsp_fire)
+                `TRACE(3, ("%t: [CHECKER] rsp  row=%0d  data[15:0]=0x%0h  count_after=%0d\n",
+                    $time, rsp_row,
+                    act_bus_if.rsp_data.data[15:0],
+                    count[rsp_row] + (row_pop[rsp_row] ? FIFO_CTR_W'(LINE_WORDS)-1 : FIFO_CTR_W'(LINE_WORDS))))
+            for (int b = 0; b < B_TILE; b++) begin
+                if (row_pop[b])
+                    `TRACE(3, ("%t: [CHECKER] pop  row=%0d  k=%0d  fp16=0x%0h\n",
+                        $time, b, rd_ptr[b], fifo[b][rd_ptr[b]]))
+            end
+        end
+    end
+`endif
 
 endmodule
