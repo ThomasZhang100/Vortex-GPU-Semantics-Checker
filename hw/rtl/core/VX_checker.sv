@@ -115,10 +115,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
             for (int b = 0; b < B_TILE; b++) begin
-                rd_ptr[b]     <= '0;
-                wr_ptr[b]     <= '0;
-                count[b]      <= '0;
-                next_chunk[b] <= '0;
+                rd_ptr[b]  <= '0;
+                wr_ptr[b]  <= '0;
+                count[b]   <= '0;
             end
             skew_done <= '0;
             state     <= IDLE;
@@ -186,6 +185,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
             issue_rr <= '0;
+            for (int b = 0; b < B_TILE; b++)
+                next_chunk[b] <= '0;
         end else if (req_fire) begin
             next_chunk[issue_row] <= next_chunk[issue_row] + CHUNKS_W'(1);
             issue_rr              <= issue_rr + ROW_ID_BITS'(1);
