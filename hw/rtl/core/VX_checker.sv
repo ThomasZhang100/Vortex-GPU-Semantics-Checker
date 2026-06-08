@@ -169,7 +169,11 @@ module VX_checker import VX_gpu_pkg::*; #(
         issue_valid = 1'b0;
         for (int i = 0; i < B_TILE; i++) begin
             automatic int bi = (int'(issue_rr) + i) % B_TILE;
+            // Suppress during rearm: Verilator evaluates comb after NBA so
+            // state=ACTIVE is already visible at the rearm cycle; without this
+            // gate a phantom L2 request fires before next_chunk can increment.
             if (!issue_valid
+                    && !rearm
                     && (state == ACTIVE)
                     && (count[bi] <= FIFO_CTR_W'(FIFO_HALF))
                     && (next_chunk[bi] < total_chunks)) begin
