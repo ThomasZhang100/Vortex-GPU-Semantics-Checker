@@ -98,17 +98,26 @@ module VX_checker import VX_gpu_pkg::*; #(
     wire [ROW_ID_BITS-1:0] rsp_row = act_bus_if.rsp_data.tag.value[ROW_ID_BITS-1:0];
 
     // -------------------------------------------------------------------------
-    // Per-row start flags and global stall
+    // Per-row start flags, consumed-element counter, and done flag
     // -------------------------------------------------------------------------
     logic [B_TILE-1:0] k_started;
+    logic [B_TILE-1:0][15:0] k_count;  // total FP16 elements consumed per row
 
-    // Stall ALL started rows if any started row's FIFO is empty.
-    // This preserves the fixed 1-cycle inter-row skew across stalls.
+    // Row b is done once it has consumed hidden_size elements.
+    logic [B_TILE-1:0] k_done;
+    always_comb begin
+        for (int b = 0; b < B_TILE; b++)
+            k_done[b] = k_started[b] && (k_count[b] >= hidden_size);
+    end
+
+    // Stall ALL non-done started rows if any non-done started row's FIFO is
+    // empty.  Done rows are excluded so trailing rows can finish their
+    // remaining elements after the first row completes.
     logic k_stall;
     always_comb begin
         k_stall = 1'b0;
         for (int b = 0; b < B_TILE; b++) begin
-            if (k_started[b] && (count[b] == '0))
+            if (k_started[b] && !k_done[b] && (count[b] == '0))
                 k_stall = 1'b1;
         end
     end
@@ -120,8 +129,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_comb begin
         for (int b = 0; b < B_TILE; b++) begin
             row_push[b] = rsp_fire && (ROW_ID_BITS'(rsp_row) == ROW_ID_BITS'(b));
-            // Row b drains when it has started; all stall together when any is empty
-            row_pop[b]  = k_started[b] && !k_stall;
+            // Done rows stop draining; active rows stall together when any is empty
+            row_pop[b]  = k_started[b] && !k_done[b] && !k_stall;
         end
     end
 
@@ -134,6 +143,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                 rd_ptr[b]  <= '0;
                 wr_ptr[b]  <= '0;
                 count[b]   <= '0;
+                k_count[b] <= '0;
             end
             k_started <= '0;
             state     <= IDLE;
@@ -164,7 +174,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                 // --- Pop: dummy consume 1 element (systolic array hook) ---
                 if (row_pop[b]) begin
                     // TODO: expose fifo[b][rd_ptr[b]] to systolic array row b
-                    rd_ptr[b] <= rd_ptr[b] + FIFO_PTR_W'(1);
+                    rd_ptr[b]  <= rd_ptr[b] + FIFO_PTR_W'(1);
+                    k_count[b] <= k_count[b] + 16'(1);
                 end
 
                 // --- Count: handle simultaneous push + pop ---
@@ -249,6 +260,13 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Simulation traces
     // -------------------------------------------------------------------------
 `ifdef SIMULATION
+    // One-cycle delayed k_done for rising-edge detection in the trace block.
+    logic [B_TILE-1:0] k_done_r;
+    always_ff @(posedge clk) begin
+        if (reset || rearm) k_done_r <= '0;
+        else                k_done_r <= k_done;
+    end
+
     always @(posedge clk) begin
         if (!reset && checker_armed) begin
             if (rearm)
@@ -264,8 +282,12 @@ module VX_checker import VX_gpu_pkg::*; #(
                     act_bus_if.rsp_data.data[15:0],
                     count[rsp_row] + (row_pop[rsp_row] ? FIFO_CTR_W'(LINE_WORDS)-1 : FIFO_CTR_W'(LINE_WORDS))))
             if (k_stall)
-                `TRACE(3, ("%t: [CHECKER] stall  k_started=%0b\n", $time, k_started))
+                `TRACE(3, ("%t: [CHECKER] stall  k_started=%0b  k_done=%0b\n",
+                    $time, k_started, k_done))
             for (int b = 0; b < B_TILE; b++) begin
+                if (k_done[b] && !k_done_r[b])
+                    `TRACE(3, ("%t: [CHECKER] done  row=%0d  consumed=%0d\n",
+                        $time, b, k_count[b]))
                 if (row_pop[b])
                     `TRACE(3, ("%t: [CHECKER] pop  row=%0d  k=%0d  fp16=0x%0h\n",
                         $time, b, rd_ptr[b], fifo[b][rd_ptr[b]]))
