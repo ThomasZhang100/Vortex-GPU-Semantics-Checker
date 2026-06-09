@@ -142,9 +142,12 @@ module VX_checker import VX_gpu_pkg::*; #(
             // Row 0: start as soon as its FIFO has any data
             if (!k_started[0] && (count[0] > '0))
                 k_started[0] <= 1'b1;
-            // Row b: start exactly 1 cycle after row b-1 (1-cycle activation skew)
+            // Row b: start the cycle row b-1 first pops (1-cycle activation skew).
+            // Triggering on row_pop[b-1] (actual pop) rather than k_started[b-1]
+            // (conceptual start) ensures k_started[b] never fires during a stall,
+            // so the fixed inter-row offset is established correctly at first start.
             for (int b = 1; b < B_TILE; b++) begin
-                if (!k_started[b] && k_started[b-1])
+                if (!k_started[b] && row_pop[b-1])
                     k_started[b] <= 1'b1;
             end
 
