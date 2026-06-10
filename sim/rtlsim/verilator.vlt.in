@@ -10,3 +10,5 @@ lint_off -file "@VORTEX_HOME@/third_party/hardfloat/*"
 
 lint_off -file "@VORTEX_HOME@/hw/rtl/core/sauria/*"
 lint_off -file "@VORTEX_HOME@/hw/rtl/core/sauria/pulp_fma/*"
+
+lint_off -rule ASCRANGE -file "@VORTEX_HOME@/hw/rtl/core/VX_checker.sv"

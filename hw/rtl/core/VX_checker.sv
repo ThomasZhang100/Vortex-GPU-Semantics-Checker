@@ -408,7 +408,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                     acc_capture[b][n] <= '0;
         end else if (sa_cscan_en) begin
             for (int b = 0; b < B_TILE; b++) begin
-                automatic int col_i = int'(SCAN_CTR_W'(SCAN_INIT) - scan_cnt) - b;
+                automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
                 if (col_i >= 0 && col_i < N_FEAT)
                     acc_capture[b][col_i] <= sa_c_out[b];
             end
@@ -542,7 +542,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                 `TRACE(3, ("%t: [CHECKER] cswitch — accumulators latched into scan chain\n", $time))
             if (sa_cscan_en)
                 `TRACE(3, ("%t: [CHECKER] scan  cnt=%0d  col[0]=%0d  sa_c_out[0]=0x%0h  sa_c_out[%0d]=0x%0h\n",
-                    $time, scan_cnt, int'(SCAN_CTR_W'(SCAN_INIT) - scan_cnt),
+                    $time, scan_cnt, int'(SCAN_INIT) - int'(scan_cnt),
                     sa_c_out[0], B_TILE-1, sa_c_out[B_TILE-1]))
             if (scan_done_pulse)
                 `TRACE(3, ("%t: [CHECKER] scan_done  flag_combo=%0b  acc[0][0]=%0d  acc[%0d][%0d]=%0d\n",
