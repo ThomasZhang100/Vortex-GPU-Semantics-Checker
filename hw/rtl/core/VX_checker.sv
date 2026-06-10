@@ -318,7 +318,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     // The "done" mask is required for correctness during drain: after row b's last
     // pop, rd_ptr[b] points one past the valid data; without the mask, the stale
     // FIFO slot is injected and accumulates a garbage product at PE[b][n].
+    /* verilator lint_off ASCRANGE */ // ascending dims match SAURIA port declarations
     wire [0:B_TILE-1][15:0] sa_a_in;
+    /* verilator lint_on ASCRANGE */
     generate
         for (genvar b = 0; b < B_TILE; b++) begin : g_sa_ain
             assign sa_a_in[b] = (k_started[b] && !k_done[b]) ? fifo[b][rd_ptr[b]] : 16'h0;
@@ -326,7 +328,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     endgenerate
 
     // Weight inputs: col_in[n] already encodes the n-cycle column skew via w_hpipe.
+    /* verilator lint_off ASCRANGE */
     wire [0:N_FEAT-1][15:0] sa_b_in;
+    /* verilator lint_on ASCRANGE */
     generate
         for (genvar n = 0; n < N_FEAT; n++) begin : g_sa_bin
             assign sa_b_in[n] = col_in[n];
@@ -357,7 +361,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Keep i_pipeline_en high during cswitch and scan so sc_reg_en propagates.
     wire sa_pipeline_en_full = sa_pipeline_en || cswitch_pulse || sa_cscan_en;
 
+    /* verilator lint_off ASCRANGE */
     wire [0:B_TILE-1][ACC_W-1:0] sa_c_out;
+    /* verilator lint_on ASCRANGE */
 
     sa_array #(
         .ARITHMETIC              (1),   // FP16 FMA via sauria_fpnew_fma (renamed from fpnew_fma)
@@ -400,7 +406,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Per-row column index: col_i = (SCAN_INIT - scan_cnt) - b.
     // col_i < 0 → cswitch hasn't fired for row b yet (skip).
     // col_i ≥ N_FEAT → row b fully captured (skip).
+    /* verilator lint_off ASCRANGE */
     logic [0:B_TILE-1][0:N_FEAT-1][ACC_W-1:0] acc_capture;
+    /* verilator lint_on ASCRANGE */
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
             for (int b = 0; b < B_TILE; b++)
