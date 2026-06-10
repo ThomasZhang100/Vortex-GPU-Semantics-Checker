@@ -211,7 +211,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[NUM_SOCKETS * `L1_MEM_PORTS], chk_act_bus_if);
 
     VX_checker #(
-        .WEIGHT_FILE ("/Users/thomaszhang/Documents/vortex-research/tests/regression/checker_test/sae_weights_test.hex")
+        .WEIGHT_FILE ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/sae_weights_test.hex")
     ) sem_checker (
         .clk              (clk),
         .reset            (reset),
