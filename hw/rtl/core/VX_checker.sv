@@ -157,9 +157,17 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     logic [DRAIN_CTR_W-1:0] drain_cnt;
     logic                   drain_started;
-    wire                    drain_active = (drain_cnt != '0);
-    // mac_done: all accumulations for every PE are complete (drain finished).
-    wire                    mac_done = drain_started && !drain_active;
+    // drain_active covers the gap cycle: k_done[0] rises one cycle before drain_cnt
+    // is loaded (sequential), so we OR in the combinational condition to ensure the
+    // weight pipe does not miss its first advance.
+    wire   drain_active = (drain_cnt != '0) || (k_done[0] && !drain_started);
+    // mac_done: 1-cycle pulse on the falling edge of drain_active (drain complete).
+    logic  drain_active_r;
+    always_ff @(posedge clk) begin
+        if (reset || rearm) drain_active_r <= 1'b0;
+        else                drain_active_r <= drain_active;
+    end
+    wire mac_done = drain_active_r && !drain_active;
 
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
@@ -460,7 +468,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                         a_pe[b][0], a_pe[b][1],
                         w_pe[b][0], w_pe[b][1]))
             end
-            if (drain_active)
+            // Show drain only when cnt > 0 (skips the gap cycle where drain_active=1 but cnt=0).
+            if (drain_cnt != '0)
                 `TRACE(3, ("%t: [CHECKER] drain  cnt=%0d  w_pe[0][0]=0x%0h  w_pe[%0d][%0d]=0x%0h  a_pe[%0d][%0d]=0x%0h\n",
                     $time, drain_cnt,
                     w_pe[0][0],
