@@ -28,7 +28,9 @@
 //   Vertical pipe (w_col[n], B_TILE-1=3 stages per column): weight flows downward.
 //     PE[0][n] = col_in[n];  PE[b][n] = w_col[n][b-1]  (b >= 1)
 //
-// Systolic array: placeholder (dummy consume only; a_pe/w_pe declared, unused).
+// Drain: after row 0's last FIFO pop a DRAIN_CYCLES=18-cycle drain phase keeps
+// all shift registers advancing so the tail propagates to PE[B_TILE-1][N_FEAT-1].
+// mac_done pulses once the drain completes; accumulators (TODO) gate on row_pop||drain_active.
 //
 // Enable: -DCHECKER_ENABLE
 // DCRs:   VX_DCR_CHECKER_ENABLE      (rising edge = start streaming)
@@ -75,6 +77,12 @@ module VX_checker import VX_gpu_pkg::*; #(
     //   Vertical pipe (VPIPE_DEPTH stages per column): propagates weight downward through rows.
     localparam HPIPE_DEPTH  = N_FEAT - 1;  // 15 for N_FEAT=16 (column injection delay)
     localparam VPIPE_DEPTH  = B_TILE - 1;  // 3  for B_TILE=4  (row propagation depth)
+    // After row 0's last FIFO pop the systolic pipes still hold tail data.
+    // DRAIN_CYCLES = 18 ensures W[hidden_size-1] reaches w_pe[B_TILE-1][N_FEAT-1]
+    // (15 hpipe stages + 3 vpipe stages) and the last activation for row B_TILE-1
+    // reaches a_pe[B_TILE-1][N_FEAT-1] (B_TILE-1 row skew + N_FEAT-1 hpipe stages).
+    localparam DRAIN_CYCLES = HPIPE_DEPTH + VPIPE_DEPTH; // 18
+    localparam DRAIN_CTR_W  = `CLOG2(DRAIN_CYCLES + 2);  // 5 bits
 
     // -------------------------------------------------------------------------
     // Rising-edge detector for checker_armed
@@ -140,6 +148,30 @@ module VX_checker import VX_gpu_pkg::*; #(
         for (int b = 0; b < B_TILE; b++) begin
             if (k_started[b] && !k_done[b] && (count[b] == '0))
                 k_stall = 1'b1;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Drain counter: after row 0's last pop, keep pipes advancing for
+    // DRAIN_CYCLES more cycles so the tail propagates to PE[B_TILE-1][N_FEAT-1].
+    // -------------------------------------------------------------------------
+    logic [DRAIN_CTR_W-1:0] drain_cnt;
+    logic                   drain_started;
+    wire                    drain_active = (drain_cnt != '0);
+    // mac_done: all accumulations for every PE are complete (drain finished).
+    wire                    mac_done = drain_started && !drain_active;
+
+    always_ff @(posedge clk) begin
+        if (reset || rearm) begin
+            drain_cnt     <= '0;
+            drain_started <= 1'b0;
+        end else begin
+            if (k_done[0] && !drain_started) begin
+                drain_cnt     <= DRAIN_CTR_W'(DRAIN_CYCLES);
+                drain_started <= 1'b1;
+            end else if (drain_active) begin
+                drain_cnt <= drain_cnt - DRAIN_CTR_W'(1);
+            end
         end
     end
 
@@ -242,12 +274,12 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     // Horizontal weight pipe (HPIPE_DEPTH = N_FEAT-1 = 15 stages, each a full weight row).
     // w_hpipe[0] = W[k] registered 1 cycle ago; w_hpipe[n-1] = W[k-n] (n cycles ago).
-    // Gate on row_pop[0]: pipe freezes during stalls to preserve column skew.
+    // Gate on row_pop[0] OR drain_active: freezes during stalls but drains after last pop.
     logic [HPIPE_DEPTH-1:0][WEIGHT_DATAW-1:0] w_hpipe;
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
             for (int s = 0; s < HPIPE_DEPTH; s++) w_hpipe[s] <= '0;
-        end else if (row_pop[0]) begin
+        end else if (row_pop[0] || drain_active) begin
             w_hpipe[0] <= weight_row_out;
             for (int s = 1; s < HPIPE_DEPTH; s++)
                 w_hpipe[s] <= w_hpipe[s-1];
@@ -275,7 +307,7 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int n = 0; n < N_FEAT; n++)
                 for (int b = 0; b < VPIPE_DEPTH; b++)
                     w_col[n][b] <= '0;
-        end else if (row_pop[0]) begin
+        end else if (row_pop[0] || drain_active) begin
             for (int n = 0; n < N_FEAT; n++) begin
                 w_col[n][0] <= col_in[n];
                 for (int b = 1; b < VPIPE_DEPTH; b++)
@@ -303,7 +335,7 @@ module VX_checker import VX_gpu_pkg::*; #(
         for (int b = 0; b < B_TILE; b++) begin
             if (reset || rearm) begin
                 for (int n = 0; n < N_FEAT-1; n++) act_hpipe[b][n] <= '0;
-            end else if (row_pop[b]) begin
+            end else if (row_pop[b] || drain_active) begin
                 act_hpipe[b][0] <= fifo[b][rd_ptr[b]];
                 for (int n = 1; n < N_FEAT-1; n++)
                     act_hpipe[b][n] <= act_hpipe[b][n-1];
@@ -428,6 +460,13 @@ module VX_checker import VX_gpu_pkg::*; #(
                         a_pe[b][0], a_pe[b][1],
                         w_pe[b][0], w_pe[b][1]))
             end
+            if (drain_active)
+                `TRACE(3, ("%t: [CHECKER] drain  cnt=%0d  w_pe[0][0]=0x%0h  w_pe[%0d][%0d]=0x%0h\n",
+                    $time, drain_cnt,
+                    w_pe[0][0],
+                    B_TILE-1, N_FEAT-1, w_pe[B_TILE-1][N_FEAT-1]))
+            if (mac_done)
+                `TRACE(3, ("%t: [CHECKER] mac_done — all PEs complete\n", $time))
         end
     end
 
