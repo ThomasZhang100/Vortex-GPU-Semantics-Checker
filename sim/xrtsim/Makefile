@@ -48,6 +48,11 @@ ifneq (,$(findstring -DFPU_FPNEW, $(CONFIGS)))
 	FPU_INCLUDE += -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src -I$(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl -I$(THIRD_PARTY_DIR)/cvfpu/src
 endif
 RTL_INCLUDE = -I$(SRC_DIR) -I$(RTL_DIR) -I$(DPI_DIR) -I$(RTL_DIR)/libs -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/cache $(FPU_INCLUDE)
+RTL_INCLUDE += -I$(RTL_DIR)/core/sauria -I$(RTL_DIR)/core/sauria/multiplier -I$(RTL_DIR)/core/sauria/adder -I$(RTL_DIR)/core/sauria/pulp_fma
+ifeq (,$(findstring -DFPU_FPNEW, $(CONFIGS)))
+	RTL_PKGS += $(THIRD_PARTY_DIR)/cvfpu/src/fpnew_pkg.sv $(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src/cf_math_pkg.sv
+	RTL_INCLUDE += -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src
+endif
 RTL_INCLUDE += -I$(AFU_DIR)
 
 # Add V extension sources

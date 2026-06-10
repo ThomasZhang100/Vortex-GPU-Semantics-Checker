@@ -1,4 +1,5 @@
-// Semantic checker — active-load SAE checker.
+// Semantic checker — active-load SAE checker backed by a 4×16 output-stationary
+// systolic array (SAURIA sa_array, ARITHMETIC=1 FP16) for the selected-feature SAE matmul.
 //
 // Activation loading: issues independent load requests through a dedicated L2
 // port (act_bus_if).  Four rows (one per token in the batch) are prefetched in
@@ -6,31 +7,39 @@
 // to half-empty and more chunks remain.
 //
 // FIFO: each row holds FIFO_DEPTH=64 FP16 elements (2 cache lines).  A cache-
-// line response pushes 32 elements; the dummy consumer pops 1 per cycle.
+// line response pushes 32 elements; the FIFO consumer pops 1 per cycle.
 //
-// Skewed/wavefront activation: row 0 starts consuming when its FIFO first
-// has data; row b starts exactly 1 cycle after row b-1.  This produces the
-// 1-cycle activation stagger a systolic array requires: at cycle t, row b
-// is processing k = t - b.
+// Skewed/wavefront activation: row 0 starts consuming when its FIFO first has
+// data; row b starts exactly 1 cycle after row b-1, establishing the inter-row
+// skew required by the systolic array.
 //
 // Global stall: if ANY started row's FIFO runs empty, all started rows stall
 // together so the fixed inter-row skew is never disturbed.
 //
-// Fully-systolic dataflow (output-stationary):
-//   Activations flow rightward: A[b][k] enters PE[b][0] from the FIFO, shifts
-//   right one column per cycle via act_hpipe[b][0..N_FEAT-2].
-//   Weights flow downward: W[k][n] is injected at PE[0][n] and propagates down.
-//   At time t, PE[b][n] sees A[b][k] and W[k][n] where k = t - b - n.
+// Fully-systolic dataflow (output-stationary, via SAURIA sa_array):
+//   Weight SRAM: private VX_dp_ram (MAX_HIDDEN rows × N_FEAT FP16 values).
+//     Read at k_count[0] each active cycle.
+//   Horizontal weight pipe (w_hpipe, HPIPE_DEPTH=15 stages):
+//     col_in[n] = W[k_count[0]-n][n]  — injects weight at top of column n.
+//   sa_array (4 rows × 16 cols):
+//     i_a_arr[b] = fifo[b][rd_ptr[b]] (zero-masked until k_started[b])
+//     i_b_arr[n] = col_in[n]
+//     Internal a_q/b_q registers replace the old act_hpipe/w_col.
+//     PE[b][n] accumulates A[b][k] * W[k][n] for all k.
 //
-// Weight SRAM: private VX_dp_ram (MAX_HIDDEN × N_FEAT FP16, 1 row/cycle).
-//   Read combinationally at raddr = k_count[0].
-//   Horizontal pipe (w_hpipe, N_FEAT-1=15 stages): col_in[n] = W[k-n][n].
-//   Vertical pipe (w_col[n], B_TILE-1=3 stages per column): weight flows downward.
-//     PE[0][n] = col_in[n];  PE[b][n] = w_col[n][b-1]  (b >= 1)
+// Drain: after row 0's last FIFO pop, DRAIN_CYCLES=21 more advances flush the
+// systolic pipes (HPIPE_DEPTH=15 + VPIPE_DEPTH=3 + PE_LATENCY=3).
+// mac_done pulses once on the falling edge of drain_active.
 //
-// Drain: after row 0's last FIFO pop a DRAIN_CYCLES=18-cycle drain phase keeps
-// all shift registers advancing so the tail propagates to PE[B_TILE-1][N_FEAT-1].
-// mac_done pulses once the drain completes; accumulators (TODO) gate on row_pop||drain_active.
+// Readout: one cswitch cycle copies all PE accumulators into the scan chain,
+// then N_FEAT+B_TILE-1=19 cscan cycles shift them out via o_c_arr per row.
+// cswitch propagates down via o_cswitch: row b's mac_sc_q is captured b cycles
+// after cswitch_pulse.  During those same cycles, earlier rows' scan chains are
+// already shifting.  Per-row offset: col captured for row b at global cscan cycle
+// D (1-indexed) is col = D - b - 1; sa_cscan_en runs for SCAN_INIT = N_FEAT +
+// B_TILE - 1 cycles to cover all rows.
+// acc_capture[b][n] holds PE[b][n]'s accumulator after readout.
+// flag asserts if any value exceeds threshold after the full scan.
 //
 // Enable: -DCHECKER_ENABLE
 // DCRs:   VX_DCR_CHECKER_ENABLE      (rising edge = start streaming)
@@ -72,17 +81,22 @@ module VX_checker import VX_gpu_pkg::*; #(
     localparam TAG_VAL_W    = L2_TAG_WIDTH - `UP(UUID_WIDTH); // value field width
     localparam WEIGHT_DATAW = N_FEAT * 16;                   // bits per weight row (256b for N_FEAT=16)
     localparam WEIGHT_ADDRW = `CLOG2(MAX_HIDDEN);            // 11b for MAX_HIDDEN=2048
-    // Fully-systolic weight distribution:
-    //   Horizontal pipe (HPIPE_DEPTH stages): injects W[k-n][n] at top of column n.
-    //   Vertical pipe (VPIPE_DEPTH stages per column): propagates weight downward through rows.
+    // Horizontal pipe (HPIPE_DEPTH stages): injects W[k-n][n] at top of column n.
+    // Vertical propagation is handled internally by sa_array's b_q registers (B_TILE-1 stages).
     localparam HPIPE_DEPTH  = N_FEAT - 1;  // 15 for N_FEAT=16 (column injection delay)
-    localparam VPIPE_DEPTH  = B_TILE - 1;  // 3  for B_TILE=4  (row propagation depth)
-    // After row 0's last FIFO pop the systolic pipes still hold tail data.
-    // DRAIN_CYCLES = 18 ensures W[hidden_size-1] reaches w_pe[B_TILE-1][N_FEAT-1]
-    // (15 hpipe stages + 3 vpipe stages) and the last activation for row B_TILE-1
-    // reaches a_pe[B_TILE-1][N_FEAT-1] (B_TILE-1 row skew + N_FEAT-1 hpipe stages).
-    localparam DRAIN_CYCLES = HPIPE_DEPTH + VPIPE_DEPTH; // 18
+    localparam VPIPE_DEPTH  = B_TILE - 1;  // 3  for B_TILE=4  (internal to sa_array)
+    localparam PE_LATENCY   = 3;           // STAGES_MUL=2 + INTERMEDIATE_PIPELINE_STAGE=1
+    // DRAIN_CYCLES: after row 0's last FIFO pop, keep pipes advancing for this many
+    // cycles so the last activation+weight reaches PE[B_TILE-1][N_FEAT-1] and the
+    // multiplier pipeline fully drains into the accumulator.
+    localparam DRAIN_CYCLES = HPIPE_DEPTH + VPIPE_DEPTH + PE_LATENCY; // 21
     localparam DRAIN_CTR_W  = `CLOG2(DRAIN_CYCLES + 2);  // 5 bits
+    localparam ACC_W        = 16;          // sa_array OC_W: FP16 accumulator (matches IA_W=IB_W=16)
+    // Scan readout: cswitch fires at τ=0 for row 0, τ=b for row b (propagates via
+    // o_cswitch 1 cycle per row).  We run SCAN_INIT = N_FEAT + B_TILE - 1 cscan
+    // cycles so every row has N_FEAT capture windows.
+    localparam SCAN_INIT    = N_FEAT + B_TILE - 1;        // 19 for N_FEAT=16, B_TILE=4
+    localparam SCAN_CTR_W   = `CLOG2(SCAN_INIT + 2);     // enough bits for 0..SCAN_INIT
 
     // -------------------------------------------------------------------------
     // Rising-edge detector for checker_armed
@@ -152,14 +166,22 @@ module VX_checker import VX_gpu_pkg::*; #(
     end
 
     // -------------------------------------------------------------------------
-    // Drain counter: after row 0's last pop, keep pipes advancing for
-    // DRAIN_CYCLES more cycles so the tail propagates to PE[B_TILE-1][N_FEAT-1].
+    // Drain counter: after row 0's last pop, keep pipes advancing DRAIN_CYCLES
+    // more cycles so the tail propagates through the entire sa_array.
+    // Gap fix: drain_active is combinationally 1 on the same cycle k_done[0]
+    // first rises (before drain_cnt is sequentially loaded), closing the 1-cycle
+    // hole where the weight pipe would otherwise miss one advance.
     // -------------------------------------------------------------------------
     logic [DRAIN_CTR_W-1:0] drain_cnt;
     logic                   drain_started;
-    wire                    drain_active = (drain_cnt != '0);
-    // mac_done: all accumulations for every PE are complete (drain finished).
-    wire                    mac_done = drain_started && !drain_active;
+    wire  drain_active = (drain_cnt != '0) || (k_done[0] && !drain_started);
+    // mac_done: 1-cycle pulse on falling edge of drain_active (all PEs complete).
+    logic drain_active_r;
+    always_ff @(posedge clk) begin
+        if (reset || rearm) drain_active_r <= 1'b0;
+        else                drain_active_r <= drain_active;
+    end
+    wire mac_done = drain_active_r && !drain_active;
 
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
@@ -206,9 +228,6 @@ module VX_checker import VX_gpu_pkg::*; #(
             if (!k_started[0] && (count[0] > '0))
                 k_started[0] <= 1'b1;
             // Row b: start the cycle row b-1 first pops (1-cycle activation skew).
-            // Triggering on row_pop[b-1] (actual pop) rather than k_started[b-1]
-            // (conceptual start) ensures k_started[b] never fires during a stall,
-            // so the fixed inter-row offset is established correctly at first start.
             for (int b = 1; b < B_TILE; b++) begin
                 if (!k_started[b] && row_pop[b-1])
                     k_started[b] <= 1'b1;
@@ -224,9 +243,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                     wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
                 end
 
-                // --- Pop: consume 1 activation element; systolic array hook ---
+                // --- Pop: advance read pointer ---
                 if (row_pop[b]) begin
-                    // TODO: feed a_pe[b][n] * w_pe[b][n] into acc[b][n] for all n
                     rd_ptr[b]  <= rd_ptr[b] + FIFO_PTR_W'(1);
                     k_count[b] <= k_count[b] + 16'(1);
                 end
@@ -246,7 +264,6 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Weight SRAM: private N_FEAT×MAX_HIDDEN FP16 storage
     // Each entry W[k] = N_FEAT FP16 values = WEIGHT_DATAW bits.
     // Read combinationally (OUT_REG=0) at raddr = k_count[0].
-    // Write port unused at runtime — weights loaded via $readmemh(WEIGHT_FILE).
     // -------------------------------------------------------------------------
     wire [WEIGHT_DATAW-1:0] weight_row_out;
 
@@ -261,20 +278,18 @@ module VX_checker import VX_gpu_pkg::*; #(
     ) weight_sram (
         .clk   (clk),
         .reset (reset),
-        // write port: unused at runtime (deploy-time load only via INIT_FILE)
         .write (1'b0),
         .wren  (1'b1),
         .waddr ({WEIGHT_ADDRW{1'b0}}),
         .wdata ({WEIGHT_DATAW{1'b0}}),
-        // read port: sequential scan of W[0..hidden_size-1], indexed by row 0's k
         .read  (1'b1),
         .raddr (k_count[0][WEIGHT_ADDRW-1:0]),
         .rdata (weight_row_out)
     );
 
     // Horizontal weight pipe (HPIPE_DEPTH = N_FEAT-1 = 15 stages, each a full weight row).
-    // w_hpipe[0] = W[k] registered 1 cycle ago; w_hpipe[n-1] = W[k-n] (n cycles ago).
-    // Gate on row_pop[0] OR drain_active: freezes during stalls but drains after last pop.
+    // col_in[n] = W[k_count[0]-n][n]: the weight entering at the TOP of column n.
+    // Gate on row_pop[0] OR drain_active to freeze during stalls, drain after last pop.
     logic [HPIPE_DEPTH-1:0][WEIGHT_DATAW-1:0] w_hpipe;
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
@@ -286,10 +301,7 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     end
 
-    // Column injection: col_in[n] = feature n delayed n cycles = W[k-n][n].
-    // This is the weight entering at the TOP of column n (PE[0][n]).
-    //   col_in[0] = weight_row_out[15:0]           (W[k][0], no delay)
-    //   col_in[n] = w_hpipe[n-1][n*16 +: 16]      (W[k-n][n], n-cycle delayed)
+    // Column injection: col_in[n] = feature n of weight row delayed n cycles.
     wire [N_FEAT-1:0][15:0] col_in;
     assign col_in[0] = weight_row_out[15:0];
     generate
@@ -298,68 +310,139 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     endgenerate
 
-    // Vertical weight pipe: each column has its own VPIPE_DEPTH=3-stage downward pipe.
-    // w_col[n][0] = col_in[n] registered 1 cycle → feeds PE[1][n]
-    // w_col[n][b-1]                               → feeds PE[b][n], for b >= 1
-    logic [N_FEAT-1:0][VPIPE_DEPTH-1:0][15:0] w_col;
+    // -------------------------------------------------------------------------
+    // SAURIA sa_array: 4×16 output-stationary systolic array (ARITHMETIC=0, integer)
+    // -------------------------------------------------------------------------
+
+    // Activation inputs: inject zero when row b hasn't started yet OR is finished.
+    // The "done" mask is required for correctness during drain: after row b's last
+    // pop, rd_ptr[b] points one past the valid data; without the mask, the stale
+    // FIFO slot is injected and accumulates a garbage product at PE[b][n].
+    wire [0:B_TILE-1][15:0] sa_a_in;
+    generate
+        for (genvar b = 0; b < B_TILE; b++) begin : g_sa_ain
+            assign sa_a_in[b] = (k_started[b] && !k_done[b]) ? fifo[b][rd_ptr[b]] : 16'h0;
+        end
+    endgenerate
+
+    // Weight inputs: col_in[n] already encodes the n-cycle column skew via w_hpipe.
+    wire [0:N_FEAT-1][15:0] sa_b_in;
+    generate
+        for (genvar n = 0; n < N_FEAT; n++) begin : g_sa_bin
+            assign sa_b_in[n] = col_in[n];
+        end
+    endgenerate
+
+    // Pipeline enable: advance sa_array during active pops and drain.
+    wire sa_pipeline_en = row_pop[0] || drain_active;
+
+    // Scan chain readout control:
+    //   cswitch_pulse (1 cycle after mac_done): fires i_cswitch_arr; row b latches
+    //     mac_q → mac_sc_q at cswitch_pulse + b cycles (via o_cswitch propagation).
+    //   scan_cnt (SCAN_INIT cycles): scan chain shifts accumulators out left-to-right.
+    logic cswitch_pulse;
+    logic [SCAN_CTR_W-1:0] scan_cnt;
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
-            for (int n = 0; n < N_FEAT; n++)
-                for (int b = 0; b < VPIPE_DEPTH; b++)
-                    w_col[n][b] <= '0;
-        end else if (row_pop[0] || drain_active) begin
-            for (int n = 0; n < N_FEAT; n++) begin
-                w_col[n][0] <= col_in[n];
-                for (int b = 1; b < VPIPE_DEPTH; b++)
-                    w_col[n][b] <= w_col[n][b-1];
-            end
+            cswitch_pulse <= 1'b0;
+            scan_cnt      <= '0;
+        end else begin
+            cswitch_pulse <= mac_done;
+            if (cswitch_pulse) scan_cnt <= SCAN_CTR_W'(SCAN_INIT);
+            else if (scan_cnt > '0) scan_cnt <= scan_cnt - SCAN_CTR_W'(1);
         end
     end
+    wire sa_cscan_en = (scan_cnt > '0);
 
-    // PE weight inputs: row 0 gets col_in (top of column); rows 1-3 get vertical pipe.
-    wire [B_TILE-1:0][N_FEAT-1:0][15:0] w_pe;
-    generate
-        for (genvar n = 0; n < N_FEAT; n++) begin : g_wpe_col
-            assign w_pe[0][n] = col_in[n];
-            for (genvar b = 1; b < B_TILE; b++) begin : g_wpe_row
-                assign w_pe[b][n] = w_col[n][b-1];
-            end
-        end
-    endgenerate
+    // Keep i_pipeline_en high during cswitch and scan so sc_reg_en propagates.
+    wire sa_pipeline_en_full = sa_pipeline_en || cswitch_pulse || sa_cscan_en;
 
-    // Per-row activation horizontal shift register (N_FEAT-1 stages).
-    // act_hpipe[b][0] = A[b][k] from 1 cycle ago (for PE[b][1]).
-    // act_hpipe[b][n-1] feeds PE[b][n].  Gate on row_pop[b].
-    logic [B_TILE-1:0][N_FEAT-2:0][15:0] act_hpipe;
+    wire [0:B_TILE-1][ACC_W-1:0] sa_c_out;
+
+    sa_array #(
+        .ARITHMETIC              (1),   // FP16 FMA via sauria_fpnew_fma (renamed from fpnew_fma)
+        .MUL_TYPE                (0),   // inferred exact multiplier
+        .ADD_TYPE                (0),   // ideal adder
+        .M_APPROX                (0),
+        .MM_APPROX               (0),
+        .A_APPROX                (0),
+        .AA_APPROX               (0),
+        .X                       (N_FEAT),
+        .Y                       (B_TILE),
+        .IA_W                    (16),
+        .IB_W                    (16),
+        .OC_W                    (ACC_W),
+        .TH_W                    (2),
+        .STAGES_MUL              (2),
+        .INTERMEDIATE_PIPELINE_STAGE (1),
+        .ZERO_GATING_MULT        (0),   // disabled; avoids zero_det_neg overhead
+        .ZERO_GATING_ADD         (0),
+        .ZD_LOOKAHEAD            (0),
+        .EXTRA_CSREG             (0)
+    ) mac_array (
+        .i_clk          (clk),
+        .i_rstn         (!reset),       // async active-low; i_reg_clear handles rearm
+        .i_a_arr        (sa_a_in),
+        .i_b_arr        (sa_b_in),
+        .i_c_arr        ('0),           // scan chain preload = zero
+        .i_reg_clear    (rearm),        // synchronous accumulator clear between batches
+        .i_pipeline_en  (sa_pipeline_en_full),
+        .i_cswitch_arr  (cswitch_pulse ? {N_FEAT{1'b1}} : {N_FEAT{1'b0}}),
+        .i_cscan_en     (sa_cscan_en),
+        .i_thres        ('0),
+        .o_c_arr        (sa_c_out)
+    );
+
+    // Capture scan chain output.
+    // cswitch fires for row b exactly b cycles after cswitch_pulse (via o_cswitch
+    // propagation).  During global cscan cycle D (1-indexed, D=1 is the first cycle
+    // after scan_cnt is loaded to SCAN_INIT), sa_c_out[b] holds mac_q[b][D-b-1].
+    // Per-row column index: col_i = (SCAN_INIT - scan_cnt) - b.
+    // col_i < 0 → cswitch hasn't fired for row b yet (skip).
+    // col_i ≥ N_FEAT → row b fully captured (skip).
+    logic [0:B_TILE-1][0:N_FEAT-1][ACC_W-1:0] acc_capture;
     always_ff @(posedge clk) begin
-        for (int b = 0; b < B_TILE; b++) begin
-            if (reset || rearm) begin
-                for (int n = 0; n < N_FEAT-1; n++) act_hpipe[b][n] <= '0;
-            end else if (row_pop[b] || drain_active) begin
-                act_hpipe[b][0] <= fifo[b][rd_ptr[b]];
-                for (int n = 1; n < N_FEAT-1; n++)
-                    act_hpipe[b][n] <= act_hpipe[b][n-1];
+        if (reset || rearm) begin
+            for (int b = 0; b < B_TILE; b++)
+                for (int n = 0; n < N_FEAT; n++)
+                    acc_capture[b][n] <= '0;
+        end else if (sa_cscan_en) begin
+            for (int b = 0; b < B_TILE; b++) begin
+                automatic int col_i = int'(SCAN_CTR_W'(SCAN_INIT) - scan_cnt) - b;
+                if (col_i >= 0 && col_i < N_FEAT)
+                    acc_capture[b][col_i] <= sa_c_out[b];
             end
         end
     end
 
-    // PE activation inputs: a_pe[b][0] = FIFO head (combinational); a_pe[b][n] = n cycles ago.
-    wire [B_TILE-1:0][N_FEAT-1:0][15:0] a_pe;
-    generate
-        for (genvar b = 0; b < B_TILE; b++) begin : g_ape_row
-            assign a_pe[b][0] = fifo[b][rd_ptr[b]];
-            for (genvar n = 1; n < N_FEAT; n++) begin : g_ape_col
-                assign a_pe[b][n] = act_hpipe[b][n-1];
-            end
-        end
-    endgenerate
+    // Flag: any accumulated FP16 value != ±0 after scan completes.
+    // FP16 +0 = 16'h0000, -0 = 16'h8000; both clear the sign bit check.
+    // Replace with a real FP16 threshold comparison for the final detector.
+    logic flag_combo;
+    always_comb begin
+        flag_combo = 1'b0;
+        for (int b = 0; b < B_TILE; b++)
+            for (int n = 0; n < N_FEAT; n++)
+                if (acc_capture[b][n][14:0] != '0) // ignore sign bit: catches ±0
+                    flag_combo = 1'b1;
+    end
+
+    // scan_done_pulse: asserted 1 cycle after the last scan column, by which time
+    // all acc_capture entries are populated and flag_combo is correct.
+    logic scan_done_pulse;
+    always_ff @(posedge clk) scan_done_pulse <= (scan_cnt == SCAN_CTR_W'(1));
+
+    logic flag;
+    always_ff @(posedge clk) begin
+        if (reset || rearm)    flag <= 1'b0;
+        else if (scan_done_pulse) flag <= flag_combo;
+    end
 
     // -------------------------------------------------------------------------
     // Issue FSM: round-robin across rows, issue when FIFO half-empty
     // -------------------------------------------------------------------------
     logic [ROW_ID_BITS-1:0] issue_rr;   // round-robin base
 
-    // Combinational: find next row needing a prefetch (starting from issue_rr)
     logic [ROW_ID_BITS-1:0] issue_row;
     logic                   issue_valid;
 
@@ -368,9 +451,6 @@ module VX_checker import VX_gpu_pkg::*; #(
         issue_valid = 1'b0;
         for (int i = 0; i < B_TILE; i++) begin
             automatic int bi = (int'(issue_rr) + i) % B_TILE;
-            // Suppress during rearm: Verilator evaluates comb after NBA so
-            // state=ACTIVE is already visible at the rearm cycle; without this
-            // gate a phantom L2 request fires before next_chunk can increment.
             if (!issue_valid
                     && !rearm
                     && (state == ACTIVE)
@@ -382,7 +462,6 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     end
 
-    // Advance round-robin and chunk counter when a request fires
     wire req_fire = act_bus_if.req_valid && act_bus_if.req_ready;
 
     always_ff @(posedge clk) begin
@@ -398,8 +477,6 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     // -------------------------------------------------------------------------
     // Request address calculation
-    // token b starts at: hidden_base_addr + b * hidden_size * 2
-    // chunk c within token b: offset += c * LINE_BYTES
     // -------------------------------------------------------------------------
     wire [`MEM_ADDR_WIDTH-1:0] req_byte_addr =
           hidden_base_addr
@@ -410,22 +487,20 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Drive act_bus_if
     // -------------------------------------------------------------------------
     assign act_bus_if.req_valid            = issue_valid;
-    assign act_bus_if.req_data.rw          = 1'b0;             // load
+    assign act_bus_if.req_data.rw          = 1'b0;
     assign act_bus_if.req_data.addr        = req_byte_addr[`MEM_ADDR_WIDTH-1:LINE_BITS];
     assign act_bus_if.req_data.data        = '0;
     assign act_bus_if.req_data.byteen      = '1;
     assign act_bus_if.req_data.flags       = '0;
     assign act_bus_if.req_data.tag.uuid    = '0;
-    // Lower ROW_ID_BITS of value encode the row; upper bits zero
     assign act_bus_if.req_data.tag.value   = TAG_VAL_W'(issue_row);
 
-    assign act_bus_if.rsp_ready = 1'b1;   // always accept responses
+    assign act_bus_if.rsp_ready = 1'b1;
 
     // -------------------------------------------------------------------------
     // Simulation traces
     // -------------------------------------------------------------------------
 `ifdef SIMULATION
-    // One-cycle delayed k_done for rising-edge detection in the trace block.
     logic [B_TILE-1:0] k_done_r;
     always_ff @(posedge clk) begin
         if (reset || rearm) k_done_r <= '0;
@@ -453,43 +528,27 @@ module VX_checker import VX_gpu_pkg::*; #(
                 if (k_done[b] && !k_done_r[b])
                     `TRACE(3, ("%t: [CHECKER] done  row=%0d  consumed=%0d\n",
                         $time, b, k_count[b]))
-                // Show col 0 and col 1 to verify both activation horizontal shift and weight skew.
                 if (row_pop[b])
-                    `TRACE(3, ("%t: [CHECKER] pop  row=%0d  k=%0d  a[col0]=0x%0h  a[col1]=0x%0h  w[col0]=0x%0h  w[col1]=0x%0h\n",
+                    `TRACE(3, ("%t: [CHECKER] pop  row=%0d  k=%0d  a_fifo=0x%0h  col_in[0]=0x%0h  col_in[1]=0x%0h\n",
                         $time, b, rd_ptr[b],
-                        a_pe[b][0], a_pe[b][1],
-                        w_pe[b][0], w_pe[b][1]))
+                        fifo[b][rd_ptr[b]], col_in[0], col_in[1]))
             end
-            if (drain_active)
-                `TRACE(3, ("%t: [CHECKER] drain  cnt=%0d  w_pe[0][0]=0x%0h  w_pe[%0d][%0d]=0x%0h  a_pe[%0d][%0d]=0x%0h\n",
-                    $time, drain_cnt,
-                    w_pe[0][0],
-                    B_TILE-1, N_FEAT-1, w_pe[B_TILE-1][N_FEAT-1],
-                    B_TILE-1, N_FEAT-1, a_pe[B_TILE-1][N_FEAT-1]))
+            if (drain_cnt != '0)
+                `TRACE(3, ("%t: [CHECKER] drain  cnt=%0d  col_in[0]=0x%0h  col_in[%0d]=0x%0h\n",
+                    $time, drain_cnt, col_in[0], N_FEAT-1, col_in[N_FEAT-1]))
             if (mac_done)
-                `TRACE(3, ("%t: [CHECKER] mac_done — all PEs complete\n", $time))
-        end
-    end
-
-    // Skew verification trace (level 4) — fires every active cycle (not just on pop).
-    //
-    // With identity weights W[k][n] = float16(k) for all n, the expected values are:
-    //   w_pe[b][n]  == float16(k_count[0] - b - n)   (combined row+col skew)
-    //   a_pe[b][n]  == A[b][k_count[0] - b - n]       (activation from FIFO, same k)
-    //
-    // The 2×2 corner [0..1][0..1] covers both skew directions; [B_TILE-1][N_FEAT-1]
-    // covers the maximum combined skew of (B_TILE-1)+(N_FEAT-1) cycles.
-    always @(posedge clk) begin
-        if (!reset && k_started[0] && !k_done[0]) begin
-            `TRACE(4, ("%t: [CHECKER] skew  K=%0d\n", $time, k_count[0]))
-            `TRACE(4, ("  w_pe[0][0]=0x%0h  w_pe[0][1]=0x%0h  (expected: K, K-1)\n",
-                w_pe[0][0], w_pe[0][1]))
-            `TRACE(4, ("  w_pe[1][0]=0x%0h  w_pe[1][1]=0x%0h  (expected: K-1, K-2)\n",
-                w_pe[1][0], w_pe[1][1]))
-            `TRACE(4, ("  w_pe[%0d][%0d]=0x%0h  (expected: K-%0d  max combined skew)\n",
-                B_TILE-1, N_FEAT-1, w_pe[B_TILE-1][N_FEAT-1], (B_TILE-1)+(N_FEAT-1)))
-            `TRACE(4, ("  a_pe[0][0]=0x%0h  a_pe[0][1]=0x%0h  a_pe[1][0]=0x%0h  a_pe[1][1]=0x%0h\n",
-                a_pe[0][0], a_pe[0][1], a_pe[1][0], a_pe[1][1]))
+                `TRACE(3, ("%t: [CHECKER] mac_done — starting cswitch+scan readout\n", $time))
+            if (cswitch_pulse)
+                `TRACE(3, ("%t: [CHECKER] cswitch — accumulators latched into scan chain\n", $time))
+            if (sa_cscan_en)
+                `TRACE(3, ("%t: [CHECKER] scan  cnt=%0d  col[0]=%0d  sa_c_out[0]=0x%0h  sa_c_out[%0d]=0x%0h\n",
+                    $time, scan_cnt, int'(SCAN_CTR_W'(SCAN_INIT) - scan_cnt),
+                    sa_c_out[0], B_TILE-1, sa_c_out[B_TILE-1]))
+            if (scan_done_pulse)
+                `TRACE(3, ("%t: [CHECKER] scan_done  flag_combo=%0b  acc[0][0]=%0d  acc[%0d][%0d]=%0d\n",
+                    $time, flag_combo,
+                    $signed(acc_capture[0][0]),
+                    B_TILE-1, N_FEAT-1, $signed(acc_capture[B_TILE-1][N_FEAT-1])))
         end
     end
 `endif
