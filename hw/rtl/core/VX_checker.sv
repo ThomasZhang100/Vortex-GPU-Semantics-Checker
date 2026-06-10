@@ -260,9 +260,11 @@ module VX_checker import VX_gpu_pkg::*; #(
     //   col_in[n] = w_hpipe[n-1][n*16 +: 16]      (W[k-n][n], n-cycle delayed)
     wire [N_FEAT-1:0][15:0] col_in;
     assign col_in[0] = weight_row_out[15:0];
-    for (genvar n = 1; n < N_FEAT; n++) begin : g_colin
-        assign col_in[n] = w_hpipe[n-1][n*16 +: 16];
-    end
+    generate
+        for (genvar n = 1; n < N_FEAT; n++) begin : g_colin
+            assign col_in[n] = w_hpipe[n-1][n*16 +: 16];
+        end
+    endgenerate
 
     // Vertical weight pipe: each column has its own VPIPE_DEPTH=3-stage downward pipe.
     // w_col[n][0] = col_in[n] registered 1 cycle → feeds PE[1][n]
@@ -284,12 +286,14 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     // PE weight inputs: row 0 gets col_in (top of column); rows 1-3 get vertical pipe.
     wire [B_TILE-1:0][N_FEAT-1:0][15:0] w_pe;
-    for (genvar n = 0; n < N_FEAT; n++) begin : g_wpe_col
-        assign w_pe[0][n] = col_in[n];
-        for (genvar b = 1; b < B_TILE; b++) begin : g_wpe_row
-            assign w_pe[b][n] = w_col[n][b-1];
+    generate
+        for (genvar n = 0; n < N_FEAT; n++) begin : g_wpe_col
+            assign w_pe[0][n] = col_in[n];
+            for (genvar b = 1; b < B_TILE; b++) begin : g_wpe_row
+                assign w_pe[b][n] = w_col[n][b-1];
+            end
         end
-    end
+    endgenerate
 
     // Per-row activation horizontal shift register (N_FEAT-1 stages).
     // act_hpipe[b][0] = A[b][k] from 1 cycle ago (for PE[b][1]).
@@ -309,12 +313,14 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     // PE activation inputs: a_pe[b][0] = FIFO head (combinational); a_pe[b][n] = n cycles ago.
     wire [B_TILE-1:0][N_FEAT-1:0][15:0] a_pe;
-    for (genvar b = 0; b < B_TILE; b++) begin : g_ape_row
-        assign a_pe[b][0] = fifo[b][rd_ptr[b]];
-        for (genvar n = 1; n < N_FEAT; n++) begin : g_ape_col
-            assign a_pe[b][n] = act_hpipe[b][n-1];
+    generate
+        for (genvar b = 0; b < B_TILE; b++) begin : g_ape_row
+            assign a_pe[b][0] = fifo[b][rd_ptr[b]];
+            for (genvar n = 1; n < N_FEAT; n++) begin : g_ape_col
+                assign a_pe[b][n] = act_hpipe[b][n-1];
+            end
         end
-    end
+    endgenerate
 
     // -------------------------------------------------------------------------
     // Issue FSM: round-robin across rows, issue when FIFO half-empty
@@ -361,8 +367,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     // Request address calculation
     // token b starts at: hidden_base_addr + b * hidden_size * 2
-    // chunk c within token b: offset += c 
-     LINE_BYTES
+    // chunk c within token b: offset += c * LINE_BYTES
     // -------------------------------------------------------------------------
     wire [`MEM_ADDR_WIDTH-1:0] req_byte_addr =
           hidden_base_addr
