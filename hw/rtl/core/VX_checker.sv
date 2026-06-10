@@ -461,10 +461,11 @@ module VX_checker import VX_gpu_pkg::*; #(
                         w_pe[b][0], w_pe[b][1]))
             end
             if (drain_active)
-                `TRACE(3, ("%t: [CHECKER] drain  cnt=%0d  w_pe[0][0]=0x%0h  w_pe[%0d][%0d]=0x%0h\n",
+                `TRACE(3, ("%t: [CHECKER] drain  cnt=%0d  w_pe[0][0]=0x%0h  w_pe[%0d][%0d]=0x%0h  a_pe[%0d][%0d]=0x%0h\n",
                     $time, drain_cnt,
                     w_pe[0][0],
-                    B_TILE-1, N_FEAT-1, w_pe[B_TILE-1][N_FEAT-1]))
+                    B_TILE-1, N_FEAT-1, w_pe[B_TILE-1][N_FEAT-1],
+                    B_TILE-1, N_FEAT-1, a_pe[B_TILE-1][N_FEAT-1]))
             if (mac_done)
                 `TRACE(3, ("%t: [CHECKER] mac_done — all PEs complete\n", $time))
         end
