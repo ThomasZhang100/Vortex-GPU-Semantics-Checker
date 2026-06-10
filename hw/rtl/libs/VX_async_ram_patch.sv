@@ -125,7 +125,7 @@ module VX_async_ram_patch #(
     parameter RADDR_RESET = 0, // read address has reset
     parameter WRITE_FIRST = 0,
     parameter INIT_ENABLE = 0,
-    parameter INIT_FILE   = "",
+    parameter `STRING INIT_FILE = "",
     parameter [DATAW-1:0] INIT_VALUE = 0,
     parameter ADDRW       = `LOG2UP(SIZE)
 ) (

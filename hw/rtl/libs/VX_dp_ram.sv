@@ -76,7 +76,7 @@ module VX_dp_ram #(
     parameter RDW_ASSERT  = 0,
     parameter RESET_RAM   = 0,
     parameter INIT_ENABLE = 0,
-    parameter INIT_FILE   = "",
+    parameter `STRING INIT_FILE = "",
     parameter [DATAW-1:0] INIT_VALUE = 0,
     parameter ADDRW       = `LOG2UP(SIZE)
 ) (
