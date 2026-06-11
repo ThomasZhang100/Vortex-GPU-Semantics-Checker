@@ -22,6 +22,7 @@
 
 const char* kernel_file = "kernel.vxbin";
 uint32_t num_elems = 16;
+bool ones_activation = false;  // -o: fill activations with fp16(1.0) for ground-truth check
 
 vx_device_h device      = nullptr;
 vx_buffer_h act_buffer  = nullptr;   // FP16 activation tensor (B_TILE × HIDDEN_SIZE)
@@ -47,15 +48,16 @@ static uint16_t float_to_fp16(float v) {
 
 static void show_usage() {
     std::cout << "Vortex checker test." << std::endl;
-    std::cout << "Usage: [-k kernel] [-n num_floats] [-h help]" << std::endl;
+    std::cout << "Usage: [-k kernel] [-n num_floats] [-o ones_activation] [-h help]" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:oh")) != -1) {
         switch (c) {
         case 'n': num_elems = atoi(optarg);  break;
         case 'k': kernel_file = optarg;      break;
+        case 'o': ones_activation = true;    break;
         case 'h': show_usage(); exit(0);
         default:  show_usage(); exit(-1);
         }
@@ -84,11 +86,12 @@ int main(int argc, char* argv[]) {
     uint64_t act_addr = 0;
     RT_CHECK(vx_mem_address(act_buffer, &act_addr));
 
-    // Fill: token b, element k → fp16(b * HIDDEN_SIZE + k + 1)
+    // Fill activations: ones mode → fp16(1.0) everywhere (expected acc = HIDDEN_SIZE per PE)
+    //                   ramp mode → fp16(b*HIDDEN_SIZE + k + 1)
     std::vector<uint16_t> h_act(B_TILE * HIDDEN_SIZE);
     for (int b = 0; b < B_TILE; ++b) {
         for (int k = 0; k < HIDDEN_SIZE; ++k) {
-            float v = (float)(b * HIDDEN_SIZE + k + 1);
+            float v = ones_activation ? 1.0f : (float)(b * HIDDEN_SIZE + k + 1);
             h_act[b * HIDDEN_SIZE + k] = float_to_fp16(v);
         }
     }

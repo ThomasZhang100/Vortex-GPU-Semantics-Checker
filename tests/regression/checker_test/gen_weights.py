@@ -11,6 +11,8 @@ feature 0 occupies the LSB of the 256-bit word:
 Two modes:
   --mode identity   W[k][n] = float16(k) for all n.
                     Used to verify the skew: at cycle t, w_pe[b][n] == float16(k_count[0]-b-n).
+  --mode ones       W[k][n] = float16(1.0) for all k < hidden_size, n.
+                    Ground-truth check: with A[b][k]=1 the expected acc[b][n] = hidden_size.
   --mode saedec     Load real SAE decoder weights from a .npy file (shape [hidden, n_feat]).
                     Pass the file with --weights <path>.
 
@@ -58,6 +60,20 @@ def gen_identity(hidden_size: int, n_feat: int, max_hidden: int) -> list[int]:
     rows = []
     for k in range(max_hidden):
         val = to_fp16_bits(float(k)) if k < hidden_size else 0
+        rows.append(pack_row([val] * n_feat, n_feat))
+    return rows
+
+
+def gen_ones(hidden_size: int, n_feat: int, max_hidden: int) -> list[int]:
+    """W[k][n] = float16(1.0) for k < hidden_size, 0 otherwise.
+
+    With A[b][k]=1.0 for all b,k the expected dot product is exactly hidden_size
+    for every PE, providing a clean ground-truth: acc[b][n] == float16(hidden_size).
+    """
+    one = to_fp16_bits(1.0)
+    rows = []
+    for k in range(max_hidden):
+        val = one if k < hidden_size else 0
         rows.append(pack_row([val] * n_feat, n_feat))
     return rows
 
@@ -122,7 +138,7 @@ def verify(rows: list[int], n_feat: int, n_check: int = 4) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode",    choices=["identity", "saedec"], default="identity")
+    p.add_argument("--mode",    choices=["identity", "ones", "saedec"], default="identity")
     p.add_argument("--hidden",  type=int, default=64,
                    help="hidden_size used in checker_test (default: 64)")
     p.add_argument("--nfeat",   type=int, default=16,
@@ -137,6 +153,8 @@ def main() -> None:
 
     if args.mode == "identity":
         rows = gen_identity(args.hidden, args.nfeat, args.maxhidden)
+    elif args.mode == "ones":
+        rows = gen_ones(args.hidden, args.nfeat, args.maxhidden)
     else:
         if args.weights is None:
             sys.exit("Error: --weights <path.npy> required for --mode saedec")
