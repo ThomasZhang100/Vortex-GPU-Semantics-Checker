@@ -89,6 +89,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     localparam HPIPE_DEPTH  = N_FEAT - 1;  // 15 for N_FEAT=16 (column injection delay)
     localparam VPIPE_DEPTH  = B_TILE - 1;  // 3  for B_TILE=4  (internal to sa_array)
     localparam PE_LATENCY   = 3;           // STAGES_MUL=2 + INTERMEDIATE_PIPELINE_STAGE=1
+    // Number of sub-accumulators created by the pipelined FMA recirculation.
+    // The cswitch + scan-out is repeated NPASS times to capture all sub-accs.
+    localparam NPASS        = PE_LATENCY;  // 3 passes, one per sub-accumulator
     // DRAIN_CYCLES: after row 0's last FIFO pop, keep pipes advancing for this many
     // cycles so the last activation+weight reaches PE[B_TILE-1][N_FEAT-1] and the
     // multiplier pipeline fully drains into the accumulator.
@@ -343,19 +346,107 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Pipeline enable: advance sa_array during active pops and drain.
     wire sa_pipeline_en = row_pop[0] || drain_active;
 
-    // Scan chain readout control:
-    //   cswitch_pulse (1 cycle after mac_done): fires i_cswitch_arr; row b latches
-    //     mac_q → mac_sc_q at cswitch_pulse + b cycles (via o_cswitch propagation).
-    //   scan_cnt (SCAN_INIT cycles): scan chain shifts accumulators out left-to-right.
+    // fp16_add: IEEE 754 FP16 addition for accumulating sub-accumulator scan values.
+    // Does not handle denormals, Inf, or NaN — sufficient for SAE output magnitudes.
+    function automatic logic [15:0] fp16_add(
+        input logic [15:0] a,
+        input logic [15:0] b
+    );
+        logic        sa, sb, sr;
+        logic [4:0]  ea, eb, er;
+        logic [10:0] ma, mb;
+        logic [11:0] ma_sh, mb_sh;
+        logic [4:0]  shift;
+        logic [12:0] sum13;
+        logic [11:0] norm12;
+        logic [4:0]  lz;
+
+        sa = a[15]; ea = a[14:10]; ma = {1'b1, a[9:0]};
+        sb = b[15]; eb = b[14:10]; mb = {1'b1, b[9:0]};
+
+        if (ea == '0) return b;
+        if (eb == '0) return a;
+
+        if (ea >= eb) begin
+            er = ea; shift = ea - eb;
+            ma_sh = {ma, 1'b0};
+            mb_sh = (|shift[4:3]) ? 12'h0 : ({mb, 1'b0} >> shift);
+        end else begin
+            er = eb; shift = eb - ea;
+            mb_sh = {mb, 1'b0};
+            ma_sh = (|shift[4:3]) ? 12'h0 : ({ma, 1'b0} >> shift);
+        end
+
+        if (sa == sb) begin
+            sr = sa;
+            sum13 = {1'b0, ma_sh} + {1'b0, mb_sh};
+            if (sum13[12]) begin
+                er = (er == 5'd30) ? 5'd30 : er + 5'd1;
+                return {sr, er, sum13[11:2]};
+            end else
+                return {sr, er, sum13[10:1]};
+        end else begin
+            if (ma_sh == mb_sh) return 16'h0;
+            if (ma_sh > mb_sh) begin
+                sr = (ea >= eb) ? sa : sb;
+                sum13 = {1'b0, ma_sh} - {1'b0, mb_sh};
+            end else begin
+                sr = (ea >= eb) ? sb : sa;
+                sum13 = {1'b0, mb_sh} - {1'b0, ma_sh};
+            end
+            norm12 = sum13[11:0];
+            casez (norm12[11:1])
+                11'b1??????????: lz = 5'd0;
+                11'b01?????????: lz = 5'd1;
+                11'b001????????: lz = 5'd2;
+                11'b0001???????: lz = 5'd3;
+                11'b00001??????: lz = 5'd4;
+                11'b000001?????: lz = 5'd5;
+                11'b0000001????: lz = 5'd6;
+                11'b00000001???: lz = 5'd7;
+                11'b000000001??: lz = 5'd8;
+                11'b0000000001?: lz = 5'd9;
+                11'b00000000001: lz = 5'd10;
+                default:         lz = 5'd11;
+            endcase
+            if (lz >= er) return 16'h0;
+            norm12 = norm12 << lz;
+            return {sr, er - lz, norm12[10:1]};
+        end
+    endfunction
+
+    // Scan chain readout control — NPASS passes to collect all PE_LATENCY sub-accumulators.
+    //
+    // The pipelined FMA (STAGES_MUL=2 + INTERMEDIATE_PIPELINE_STAGE=1 = PE_LATENCY=3 stages)
+    // creates PE_LATENCY=3 interleaved sub-accumulators in mac_q with period 3.  A single
+    // cswitch captures only one.  We fire cswitch NPASS=3 times with a gap of exactly
+    // SCAN_INIT+1 = 20 cycles between consecutive cswitch pulses.  20 mod 3 = 2 ≠ 0, so the
+    // three cswitch cycles land at three distinct sub-accumulator phases, capturing them all.
+    // acc_capture FP16-adds each pass's scan values to accumulate the full dot product.
     logic cswitch_pulse;
     logic [SCAN_CTR_W-1:0] scan_cnt;
+    logic [1:0] pass_cnt;           // which pass we're on (0..NPASS-1)
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
             cswitch_pulse <= 1'b0;
             scan_cnt      <= '0;
+            pass_cnt      <= '0;
         end else begin
-            cswitch_pulse <= mac_done;
-            if (cswitch_pulse) scan_cnt <= SCAN_CTR_W'(SCAN_INIT);
+            // Fire cswitch: start of first pass (mac_done) or immediately after each scan
+            // completes for passes 1 and 2 (scan_cnt==1 with more passes remaining).
+            // At scan_cnt==1 the scan_cnt will decrement to 0 next cycle, and cswitch fires
+            // that same next cycle (gap = SCAN_INIT+1 = 20 cycles, 20 mod 3 = 2 ≠ 0 ✓).
+            if (mac_done || (scan_cnt == SCAN_CTR_W'(1) && pass_cnt < 2'(NPASS-1)))
+                cswitch_pulse <= 1'b1;
+            else
+                cswitch_pulse <= 1'b0;
+
+            // Advance pass counter whenever a scan completes mid-sequence.
+            if (scan_cnt == SCAN_CTR_W'(1) && pass_cnt < 2'(NPASS-1))
+                pass_cnt <= pass_cnt + 2'b1;
+
+            // scan_cnt: reloads SCAN_INIT after each cswitch, counts down to 0.
+            if (cswitch_pulse)      scan_cnt <= SCAN_CTR_W'(SCAN_INIT);
             else if (scan_cnt > '0) scan_cnt <= scan_cnt - SCAN_CTR_W'(1);
         end
     end
@@ -402,13 +493,10 @@ module VX_checker import VX_gpu_pkg::*; #(
         .o_c_arr        (sa_c_out)
     );
 
-    // Capture scan chain output.
-    // cswitch fires for row b exactly b cycles after cswitch_pulse (via o_cswitch
-    // propagation).  During global cscan cycle D (1-indexed, D=1 is the first cycle
-    // after scan_cnt is loaded to SCAN_INIT), sa_c_out[b] holds mac_q[b][D-b-1].
-    // Per-row column index: col_i = (SCAN_INIT - scan_cnt) - b.
-    // col_i < 0 → cswitch hasn't fired for row b yet (skip).
-    // col_i ≥ N_FEAT → row b fully captured (skip).
+    // Capture scan chain output across all NPASS passes.
+    // Each pass: col_i = (SCAN_INIT - scan_cnt) - b for row b.
+    // FP16-add each pass's value into acc_capture so the final result is the
+    // full dot product (sum of all three sub-accumulator contributions).
     /* verilator lint_off ASCRANGE */
     logic [0:B_TILE-1][0:N_FEAT-1][ACC_W-1:0] acc_capture;
     /* verilator lint_on ASCRANGE */
@@ -421,27 +509,27 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int b = 0; b < B_TILE; b++) begin
                 automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
                 if (col_i >= 0 && col_i < N_FEAT)
-                    acc_capture[b][col_i] <= sa_c_out[b];
+                    acc_capture[b][col_i] <= fp16_add(acc_capture[b][col_i], sa_c_out[b]);
             end
         end
     end
 
-    // Flag: any accumulated FP16 value != ±0 after scan completes.
-    // FP16 +0 = 16'h0000, -0 = 16'h8000; both clear the sign bit check.
+    // Flag: any accumulated FP16 value != ±0 after all passes complete.
     // Replace with a real FP16 threshold comparison for the final detector.
     logic flag_combo;
     always_comb begin
         flag_combo = 1'b0;
         for (int b = 0; b < B_TILE; b++)
             for (int n = 0; n < N_FEAT; n++)
-                if (acc_capture[b][n][14:0] != '0) // ignore sign bit: catches ±0
+                if (acc_capture[b][n][14:0] != '0)
                     flag_combo = 1'b1;
     end
 
-    // scan_done_pulse: asserted 1 cycle after the last scan column, by which time
-    // all acc_capture entries are populated and flag_combo is correct.
+    // scan_done_pulse: fires 1 cycle after the LAST pass's final scan column.
+    // pass_cnt == NPASS-1 gates this to fire only after all 3 passes are done.
     logic scan_done_pulse;
-    always_ff @(posedge clk) scan_done_pulse <= (scan_cnt == SCAN_CTR_W'(1));
+    always_ff @(posedge clk)
+        scan_done_pulse <= (scan_cnt == SCAN_CTR_W'(1) && pass_cnt == 2'(NPASS-1));
 
     logic flag;
     always_ff @(posedge clk) begin
@@ -551,16 +639,16 @@ module VX_checker import VX_gpu_pkg::*; #(
             if (mac_done)
                 `TRACE(3, ("%t: [CHECKER] mac_done — starting cswitch+scan readout\n", $time))
             if (cswitch_pulse)
-                `TRACE(3, ("%t: [CHECKER] cswitch — accumulators latched into scan chain\n", $time))
+                `TRACE(3, ("%t: [CHECKER] cswitch pass=%0d — accumulators latched into scan chain\n", $time, pass_cnt))
             if (sa_cscan_en)
                 `TRACE(3, ("%t: [CHECKER] scan  cnt=%0d  col[0]=%0d  sa_c_out[0]=0x%0h  sa_c_out[%0d]=0x%0h\n",
                     $time, scan_cnt, int'(SCAN_INIT) - int'(scan_cnt),
                     sa_c_out[0], B_TILE-1, sa_c_out[B_TILE-1]))
             if (scan_done_pulse)
-                `TRACE(3, ("%t: [CHECKER] scan_done  flag_combo=%0b  acc[0][0]=%0d  acc[%0d][%0d]=%0d\n",
+                `TRACE(3, ("%t: [CHECKER] scan_done  flag=%0b  acc[0][0]=0x%04h  acc[0][15]=0x%04h  acc[3][0]=0x%04h  acc[3][15]=0x%04h\n",
                     $time, flag_combo,
-                    $signed(acc_capture[0][0]),
-                    B_TILE-1, N_FEAT-1, $signed(acc_capture[B_TILE-1][N_FEAT-1])))
+                    acc_capture[0][0], acc_capture[0][N_FEAT-1],
+                    acc_capture[B_TILE-1][0], acc_capture[B_TILE-1][N_FEAT-1]))
         end
     end
 `endif
