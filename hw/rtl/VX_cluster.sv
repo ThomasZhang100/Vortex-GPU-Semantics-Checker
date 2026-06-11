@@ -210,6 +210,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[NUM_SOCKETS * `L1_MEM_PORTS], chk_act_bus_if);
 
+    wire checker_flag;
     VX_checker #(
         .WEIGHT_FILE ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/sae_weights_test.hex")
     ) sem_checker (
@@ -219,8 +220,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .hidden_base_addr (checker_hidden_base_addr),
         .hidden_size      (checker_hidden_size),
         .batch_size       (checker_batch_size),
+        .flag_o           (checker_flag),
         .act_bus_if       (chk_act_bus_if)
     );
+    `UNUSED_VAR (checker_flag);
 `endif
 
 endmodule

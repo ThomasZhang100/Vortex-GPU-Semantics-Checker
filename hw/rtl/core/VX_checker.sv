@@ -66,6 +66,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     input  wire [15:0]                  hidden_size,   // FP16 elements per token
     input  wire [3:0]                   batch_size,    // tokens this batch (≤ B_TILE)
 
+    // Flag output: asserted one cycle after scan completes if any SAE feature is non-zero
+    output wire                         flag_o,
+
     // Dedicated L2 port for activation prefetch
     VX_mem_bus_if.master                act_bus_if
 );
@@ -445,6 +448,7 @@ module VX_checker import VX_gpu_pkg::*; #(
         if (reset || rearm)    flag <= 1'b0;
         else if (scan_done_pulse) flag <= flag_combo;
     end
+    assign flag_o = flag;
 
     // -------------------------------------------------------------------------
     // Issue FSM: round-robin across rows, issue when FIFO half-empty
