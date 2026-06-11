@@ -13,6 +13,7 @@
 
 `include "common_cells/registers.svh"
 
+/* verilator lint_off BLKANDNBLK */ // pipeline arrays mix assign (index 0) with always_ff (indices 1..N)
 module sauria_fpnew_fma #(
   parameter fpnew_pkg::fp_format_e   FpFormat    = fpnew_pkg::fp_format_e'(0),
   parameter int unsigned             NumPipeRegs = 0,
@@ -866,3 +867,4 @@ module sauria_fpnew_fma #(
   assign out_valid_o     = out_pipe_valid_q[NUM_OUT_REGS];
   assign busy_o          = (| {inp_pipe_valid_q, mid_pipe_valid_q, out_pipe_valid_q});
 endmodule
+/* verilator lint_on BLKANDNBLK */
