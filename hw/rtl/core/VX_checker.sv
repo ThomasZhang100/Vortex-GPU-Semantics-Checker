@@ -419,8 +419,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Negative a (sign bit set) is always below any non-negative threshold.
     // For two non-negative FP16 values, IEEE 754 ordering matches unsigned bit ordering.
     function automatic logic fp16_gt(input logic [15:0] a, input logic [15:0] th);
-        if (a[15]) return 1'b0;
-        return a[14:0] > th[14:0];
+        if (a[15])  return 1'b0;   // a is negative → always below non-negative threshold
+        if (th[15]) return 1'b1;   // threshold is negative → every non-negative a passes
+        return a[14:0] > th[14:0]; // both non-negative: IEEE 754 ordering = unsigned bit ordering
     endfunction
 
     // Per-row flag: starts all-1 each batch; ANDs in per-feature comparisons as
