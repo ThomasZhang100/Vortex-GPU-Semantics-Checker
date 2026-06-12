@@ -38,8 +38,11 @@
 // already shifting.  Per-row offset: col captured for row b at global cscan cycle
 // D (1-indexed) is col = D - b - 1; sa_cscan_en runs for SCAN_INIT = N_FEAT +
 // B_TILE - 1 cycles to cover all rows.
-// acc_capture[b][n] holds PE[b][n]'s accumulator after readout.
-// flag asserts if any value exceeds threshold after the full scan.
+// Per-row flagging: during scan, sa_c_out[b] for feature col_i is compared on the
+// fly against threshold[col_i] (one FP16 threshold per feature, from THRESHOLD_FILE).
+// row_flag[b] starts at 1 and ANDs down; cleared if any feature falls at or below
+// its threshold.  flag_o[b] asserts after scan_done for rows b < batch_size that
+// pass all N_FEAT feature comparisons.
 //
 // Enable: -DCHECKER_ENABLE
 // DCRs:   VX_DCR_CHECKER_ENABLE      (rising edge = start streaming)
@@ -55,7 +58,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     parameter MAX_HIDDEN    = 2048,            // max hidden_size supported (SRAM depth)
     parameter FIFO_DEPTH    = 64,              // FP16 slots per row  (2 cache lines)
     parameter LINE_WORDS    = `L1_LINE_SIZE/2, // FP16 values per cache line (64B/2B=32)
-    parameter `STRING WEIGHT_FILE = ""         // $readmemh hex path for SAE weights ("" → zeros)
+    parameter `STRING WEIGHT_FILE    = "",      // $readmemh hex path for SAE weights ("" → zeros)
+    parameter `STRING THRESHOLD_FILE = ""      // $readmemh hex path for N_FEAT FP16 thresholds ("" → 0)
 ) (
     input  wire clk,
     input  wire reset,
@@ -66,8 +70,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     input  wire [15:0]                  hidden_size,   // FP16 elements per token
     input  wire [3:0]                   batch_size,    // tokens this batch (≤ B_TILE)
 
-    // Flag output: asserted one cycle after scan completes if any SAE feature is non-zero
-    output wire                         flag_o,
+    // Per-row flags: flag_o[b]=1 after scan if ALL N_FEAT features of row b exceeded
+    // their per-feature threshold.  Rows b >= batch_size are always 0.
+    output wire [B_TILE-1:0]            flag_o,
 
     // Dedicated L2 port for activation prefetch
     VX_mem_bus_if.master                act_bus_if
@@ -290,6 +295,14 @@ module VX_checker import VX_gpu_pkg::*; #(
         .rdata (weight_row_out)
     );
 
+    // Per-feature FP16 thresholds: N_FEAT values loaded from THRESHOLD_FILE at init.
+    // If THRESHOLD_FILE is empty all thresholds default to +0 (every positive value passes).
+    logic [15:0] threshold [0:N_FEAT-1];
+    initial begin
+        if (THRESHOLD_FILE != "") $readmemh(THRESHOLD_FILE, threshold);
+        else for (int n = 0; n < N_FEAT; n++) threshold[n] = '0;
+    end
+
     // Horizontal weight pipe (HPIPE_DEPTH = N_FEAT-1 = 15 stages, each a full weight row).
     // col_in[n] = W[k_count[0]-n][n]: the weight entering at the TOP of column n.
     // Gate on row_pop[0] OR drain_active to freeze during stalls, drain after last pop.
@@ -402,47 +415,46 @@ module VX_checker import VX_gpu_pkg::*; #(
         .o_c_arr        (sa_c_out)
     );
 
-    // Capture scan chain output. Single pass captures the complete dot product
-    // (PE_LATENCY=1 → one sub-accumulator, no multi-pass needed).
-    // col_i = (SCAN_INIT - scan_cnt) - b for row b during scan.
-    /* verilator lint_off ASCRANGE */
-    logic [0:B_TILE-1][0:N_FEAT-1][ACC_W-1:0] acc_capture;
-    /* verilator lint_on ASCRANGE */
+    // FP16 greater-than for non-negative thresholds.
+    // Negative a (sign bit set) is always below any non-negative threshold.
+    // For two non-negative FP16 values, IEEE 754 ordering matches unsigned bit ordering.
+    function automatic logic fp16_gt(input logic [15:0] a, input logic [15:0] th);
+        if (a[15]) return 1'b0;
+        return a[14:0] > th[14:0];
+    endfunction
+
+    // Per-row flag: starts all-1 each batch; ANDs in per-feature comparisons as
+    // values scan out.  row_flag[b] becomes 0 if any feature of row b falls at or
+    // below its threshold.
+    logic [B_TILE-1:0] row_flag;
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
-            for (int b = 0; b < B_TILE; b++)
-                for (int n = 0; n < N_FEAT; n++)
-                    acc_capture[b][n] <= '0;
+            row_flag <= '1;
         end else if (sa_cscan_en) begin
             for (int b = 0; b < B_TILE; b++) begin
                 automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
-                if (col_i >= 0 && col_i < N_FEAT)
-                    acc_capture[b][col_i] <= sa_c_out[b];
+                if (col_i >= 0 && col_i < N_FEAT) begin
+                    if (!fp16_gt(sa_c_out[b], threshold[col_i]))
+                        row_flag[b] <= 1'b0;
+                end
             end
         end
     end
 
-    // Flag: any accumulated FP16 value != ±0 after scan completes.
-    // Replace with a real FP16 threshold comparison for the final detector.
-    logic flag_combo;
-    always_comb begin
-        flag_combo = 1'b0;
-        for (int b = 0; b < B_TILE; b++)
-            for (int n = 0; n < N_FEAT; n++)
-                if (acc_capture[b][n][14:0] != '0)
-                    flag_combo = 1'b1;
-    end
-
-    // scan_done_pulse: 1 cycle after the last scan column is captured.
+    // scan_done_pulse: 1 cycle after the last scan cycle completes.
     logic scan_done_pulse;
     always_ff @(posedge clk) scan_done_pulse <= (scan_cnt == SCAN_CTR_W'(1));
 
-    logic flag;
+    // Latch per-row flags on scan_done; mask rows at or beyond batch_size to 0.
+    logic [B_TILE-1:0] flag_r;
     always_ff @(posedge clk) begin
-        if (reset || rearm)    flag <= 1'b0;
-        else if (scan_done_pulse) flag <= flag_combo;
+        if (reset || rearm) flag_r <= '0;
+        else if (scan_done_pulse) begin
+            for (int b = 0; b < B_TILE; b++)
+                flag_r[b] <= row_flag[b] && (4'(b) < batch_size);
+        end
     end
-    assign flag_o = flag;
+    assign flag_o = flag_r;
 
     // -------------------------------------------------------------------------
     // Issue FSM: round-robin across rows, issue when FIFO half-empty
@@ -551,10 +563,9 @@ module VX_checker import VX_gpu_pkg::*; #(
                     $time, scan_cnt, int'(SCAN_INIT) - int'(scan_cnt),
                     sa_c_out[0], B_TILE-1, sa_c_out[B_TILE-1]))
             if (scan_done_pulse)
-                `TRACE(3, ("%t: [CHECKER] scan_done  flag=%0b  acc[0][0]=0x%04h  acc[0][15]=0x%04h  acc[3][0]=0x%04h  acc[3][15]=0x%04h\n",
-                    $time, flag_combo,
-                    acc_capture[0][0], acc_capture[0][N_FEAT-1],
-                    acc_capture[B_TILE-1][0], acc_capture[B_TILE-1][N_FEAT-1]))
+                `TRACE(3, ("%t: [CHECKER] scan_done  row_flag=0x%0x  flag[0]=%0b  flag[1]=%0b  flag[2]=%0b  flag[3]=%0b\n",
+                    $time, row_flag,
+                    row_flag[0], row_flag[1], row_flag[2], row_flag[3]))
         end
     end
 `endif
