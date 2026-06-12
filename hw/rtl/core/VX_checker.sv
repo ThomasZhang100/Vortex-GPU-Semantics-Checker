@@ -542,6 +542,61 @@ module VX_checker import VX_gpu_pkg::*; #(
         else                     k_done_r <= k_done;
     end
 
+    // Capture the full B_TILE×N_FEAT matmul output during the scan phase.
+    // col_i for row b at scan_cnt = SCAN_INIT - scan_cnt - b (same as row_flag indexing).
+    logic [B_TILE-1:0][N_FEAT-1:0][15:0] scan_capture;
+    always_ff @(posedge clk) begin
+        if (reset || pass_reset) begin
+            scan_capture <= '0;
+        end else if (sa_cscan_en) begin
+            for (int b = 0; b < B_TILE; b++) begin
+                automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
+                if (col_i >= 0 && col_i < N_FEAT)
+                    scan_capture[b][col_i] <= sa_c_out[b];
+            end
+        end
+    end
+
+    // Accumulate completed passes into a full [MAX_BATCH × MAX_FEATURES] matrix.
+    // Reads pre-reset scan_capture (NBA semantics guarantee pre-edge value).
+    logic [MAX_BATCH-1:0][MAX_FEATURES-1:0][15:0] full_matrix_capture;
+    always_ff @(posedge clk) begin
+        if (reset || rearm) begin
+            full_matrix_capture <= '0;
+        end else if (scan_done_pulse) begin
+            for (int b = 0; b < B_TILE; b++) begin
+                for (int n = 0; n < N_FEAT; n++) begin
+                    automatic int gb = int'(batch_tile) * B_TILE + b;
+                    automatic int gf = int'(feat_tile)  * N_FEAT + n;
+                    if (gb < MAX_BATCH && gf < MAX_FEATURES)
+                        full_matrix_capture[gb][gf] <= scan_capture[b][n];
+                end
+            end
+        end
+    end
+
+    // Decode a raw FP16 bit-pattern to a SV real for display.
+    function automatic real fp16_to_real(input logic [15:0] h);
+        logic       sign;
+        logic [4:0] exp5;
+        logic [9:0] mant10;
+        int         e;
+        real        mag;
+        sign   = h[15];
+        exp5   = h[14:10];
+        mant10 = h[9:0];
+        if (&exp5) begin             // Inf / NaN → 0 for display
+            return 0.0;
+        end else if (exp5 == '0) begin  // subnormal: 0.mant × 2^−14
+            mag = real'(mant10) / 1024.0 / 16384.0;
+            return sign ? -mag : mag;
+        end else begin               // normal: 1.mant × 2^(exp−15)
+            e   = int'(exp5) - 15;
+            mag = (1.0 + real'(mant10) / 1024.0) * (2.0 ** e);
+            return sign ? -mag : mag;
+        end
+    endfunction
+
     always @(posedge clk) begin
         if (!reset && checker_armed) begin
             if (rearm)
@@ -568,11 +623,31 @@ module VX_checker import VX_gpu_pkg::*; #(
             if (sa_cscan_en)
                 `TRACE(3, ("%t: [CHECKER] scan  cnt=%0d  sa_c_out[0]=0x%0h  sa_c_out[%0d]=0x%0h\n",
                     $time, scan_cnt, sa_c_out[0], B_TILE-1, sa_c_out[B_TILE-1]))
-            if (scan_done_pulse)
+            if (scan_done_pulse) begin
                 `TRACE(3, ("%t: [CHECKER] scan_done  bt=%0d ft=%0d  row_flag=0x%0x  last_ft=%0b last_bt=%0b\n",
                     $time, batch_tile, feat_tile, row_flag, last_feat_tile, last_batch_tile))
-            if (scan_done_pulse && last_feat_tile && last_batch_tile)
+                // Full B_TILE×N_FEAT matmul output for this pass.
+                for (int b = 0; b < B_TILE; b++) begin
+                    automatic int gb = int'(batch_tile) * B_TILE + b;
+                    `TRACE(3, ("%t: [CHECKER]   acc[tok=%0d] feat[%0d..%0d]:", $time, gb,
+                               int'(feat_tile) * N_FEAT, int'(feat_tile) * N_FEAT + N_FEAT - 1))
+                    for (int n = 0; n < N_FEAT; n++)
+                        `TRACE(3, (" %04h", scan_capture[b][n]))
+                    `TRACE(3, ("\n"))
+                end
+            end
+            if (scan_done_pulse && last_feat_tile && last_batch_tile) begin
                 `TRACE(3, ("%t: [CHECKER] ALL_DONE  global_flag=0x%0x\n", $time, global_flag))
+                `TRACE(3, ("%t: [CHECKER] === FULL MATMUL OUTPUT (batch=%0d, features=%0d) ===\n",
+                           $time, batch_size, num_features))
+                for (int gb = 0; gb < int'(batch_size); gb++) begin
+                    `TRACE(3, ("%t: [CHECKER]   tok[%0d]:", $time, gb))
+                    for (int gf = 0; gf < int'(num_features); gf++)
+                        `TRACE(3, (" %g", fp16_to_real(full_matrix_capture[gb][gf])))
+                    `TRACE(3, ("\n"))
+                end
+                `TRACE(3, ("%t: [CHECKER] ================================================\n", $time))
+            end
         end
     end
 `endif
