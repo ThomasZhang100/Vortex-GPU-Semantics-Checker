@@ -297,10 +297,12 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     // Per-feature FP16 thresholds: MAX_FEATURES values loaded from THRESHOLD_FILE at init.
     // If THRESHOLD_FILE is empty, all thresholds default to +0 (every positive value passes).
+    // Threshold array: always zero-initialized first so entries beyond num_features
+    // are 0 (not X) even when the hex file has fewer than MAX_FEATURES lines.
     logic [15:0] threshold [0:MAX_FEATURES-1];
     initial begin
+        for (int n = 0; n < MAX_FEATURES; n++) threshold[n] = '0;
         if (THRESHOLD_FILE != "") $readmemh(THRESHOLD_FILE, threshold);
-        else for (int n = 0; n < MAX_FEATURES; n++) threshold[n] = '0;
     end
 
     // Extract the current feat_tile's N_FEAT column slice from the SRAM output row.
@@ -498,6 +500,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_ff @(posedge clk) begin
         if (reset || pass_reset) begin
             issue_rr <= '0;
+      
             for (int b = 0; b < B_TILE; b++)
                 next_chunk[b] <= '0;
         end else if (req_fire) begin
