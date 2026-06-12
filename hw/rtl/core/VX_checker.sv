@@ -562,7 +562,10 @@ module VX_checker import VX_gpu_pkg::*; #(
     logic [MAX_BATCH-1:0][MAX_FEATURES-1:0][15:0] full_matrix_capture;
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
-            full_matrix_capture <= '0;
+            // Element-wise clear avoids >8K-bit replication (Verilator WIDTHCONCAT).
+            for (int gb = 0; gb < MAX_BATCH; gb++)
+                for (int gf = 0; gf < MAX_FEATURES; gf++)
+                    full_matrix_capture[gb][gf] <= '0;
         end else if (scan_done_pulse) begin
             for (int b = 0; b < B_TILE; b++) begin
                 for (int n = 0; n < N_FEAT; n++) begin
@@ -575,26 +578,18 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     end
 
-    // Decode a raw FP16 bit-pattern to a SV real for display.
-    function automatic real fp16_to_real(input logic [15:0] h);
-        logic       sign;
-        logic [4:0] exp5;
-        logic [9:0] mant10;
-        int         e;
-        real        mag;
-        sign   = h[15];
-        exp5   = h[14:10];
-        mant10 = h[9:0];
-        if (&exp5) begin             // Inf / NaN → 0 for display
-            return 0.0;
-        end else if (exp5 == '0) begin  // subnormal: 0.mant × 2^−14
-            mag = real'(mant10) / 1024.0 / 16384.0;
-            return sign ? -mag : mag;
-        end else begin               // normal: 1.mant × 2^(exp−15)
-            e   = int'(exp5) - 15;
-            mag = (1.0 + real'(mant10) / 1024.0) * (2.0 ** e);
-            return sign ? -mag : mag;
-        end
+    // Reinterpret an FP16 bit-pattern as a shortreal (FP32) for display.
+    // Technique: expand bits to FP32 layout (rebias exponent by +112, pad mantissa),
+    // then use $bitstoshortreal so the simulator formats it natively with %g.
+    function automatic shortreal fp16_to_shortreal(input logic [15:0] h);
+        logic        sign   = h[15];
+        logic [4:0]  exp5   = h[14:10];
+        logic [9:0]  mant10 = h[9:0];
+        logic [31:0] f32;
+        if (exp5 == '0)        f32 = {sign, 31'b0};                          // zero / subnormal
+        else if (&exp5)        f32 = {sign, 8'hFF, 13'b0, mant10};           // Inf / NaN
+        else                   f32 = {sign, 8'({3'b0, exp5} + 8'd112), mant10, 13'b0}; // normal
+        return $bitstoshortreal(f32);
     endfunction
 
     always @(posedge clk) begin
@@ -643,7 +638,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                 for (int gb = 0; gb < int'(batch_size); gb++) begin
                     `TRACE(3, ("%t: [CHECKER]   tok[%0d]:", $time, gb))
                     for (int gf = 0; gf < int'(num_features); gf++)
-                        `TRACE(3, (" %g", fp16_to_real(full_matrix_capture[gb][gf])))
+                        `TRACE(3, (" %g", fp16_to_shortreal(full_matrix_capture[gb][gf])))
                     `TRACE(3, ("\n"))
                 end
                 `TRACE(3, ("%t: [CHECKER] ================================================\n", $time))
