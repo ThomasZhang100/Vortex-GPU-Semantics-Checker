@@ -542,6 +542,15 @@ module VX_checker import VX_gpu_pkg::*; #(
         else                     k_done_r <= k_done;
     end
 
+    // Delay ALL_DONE by 1 cycle so the full-matrix dump reads committed values.
+    // full_matrix_capture[last_bt][last_ft] and global_flag[last_bt_rows] are both
+    // written (NBA) at the posedge scan_done_pulse fires for the last pass; reading
+    // them at that same posedge sees pre-update values.  all_done_r fires one cycle
+    // later when all writes are committed.
+    logic all_done_r;
+    always_ff @(posedge clk)
+        all_done_r <= scan_done_pulse && last_feat_tile && last_batch_tile;
+
     // Capture the full B_TILE×N_FEAT matmul output during the scan phase.
     // col_i for row b at scan_cnt = SCAN_INIT - scan_cnt - b (same as row_flag indexing).
     logic [B_TILE-1:0][N_FEAT-1:0][15:0] scan_capture;
@@ -634,7 +643,11 @@ module VX_checker import VX_gpu_pkg::*; #(
                     `TRACE(3, ("\n"))
                 end
             end
-            if (scan_done_pulse && last_feat_tile && last_batch_tile) begin
+            if (scan_done_pulse && last_feat_tile && last_batch_tile)
+                `TRACE(3, ("%t: [CHECKER] ALL_DONE (full matrix dump follows in 1 cycle)\n", $time))
+            // Dump on all_done_r (1 cycle after ALL_DONE) so full_matrix_capture and
+            // global_flag have their final committed values for the last pass.
+            if (all_done_r) begin
                 `TRACE(3, ("%t: [CHECKER] ALL_DONE  global_flag=0x%0x\n", $time, global_flag))
                 `TRACE(3, ("%t: [CHECKER] === FULL MATMUL OUTPUT (batch=%0d, features=%0d) ===\n",
                            $time, batch_size, num_features))
