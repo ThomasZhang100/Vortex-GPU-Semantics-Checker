@@ -578,18 +578,21 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     end
 
-    // Reinterpret an FP16 bit-pattern as a shortreal (FP32) for display.
-    // Technique: expand bits to FP32 layout (rebias exponent by +112, pad mantissa),
-    // then use $bitstoshortreal so the simulator formats it natively with %g.
-    function automatic shortreal fp16_to_shortreal(input logic [15:0] h);
-        logic        sign   = h[15];
-        logic [4:0]  exp5   = h[14:10];
-        logic [9:0]  mant10 = h[9:0];
-        logic [31:0] f32;
-        if (exp5 == '0)        f32 = {sign, 31'b0};                          // zero / subnormal
-        else if (&exp5)        f32 = {sign, 8'hFF, 13'b0, mant10};           // Inf / NaN
-        else                   f32 = {sign, 8'({3'b0, exp5} + 8'd112), mant10, 13'b0}; // normal
-        return $bitstoshortreal(f32);
+    // Decode a raw FP16 bit-pattern to a SV real for display.
+    function automatic real fp16_to_real(input logic [15:0] h);
+        logic       sign   = h[15];
+        logic [4:0] exp5   = h[14:10];
+        logic [9:0] mant10 = h[9:0];
+        int         e;
+        real        mag;
+        if (&exp5)         return 0.0;  // Inf / NaN → 0 for display
+        if (exp5 == '0) begin           // subnormal: 0.mant × 2^−14
+            mag = real'(mant10) / 1024.0 / 16384.0;
+            return sign ? -mag : mag;
+        end
+        e   = int'(exp5) - 15;          // normal: 1.mant × 2^(exp−15)
+        mag = (1.0 + real'(mant10) / 1024.0) * (2.0 ** e);
+        return sign ? -mag : mag;
     endfunction
 
     always @(posedge clk) begin
@@ -638,7 +641,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                 for (int gb = 0; gb < int'(batch_size); gb++) begin
                     `TRACE(3, ("%t: [CHECKER]   tok[%0d]:", $time, gb))
                     for (int gf = 0; gf < int'(num_features); gf++)
-                        `TRACE(3, (" %g", fp16_to_shortreal(full_matrix_capture[gb][gf])))
+                        `TRACE(3, (" %g", fp16_to_real(full_matrix_capture[gb][gf])))
                     `TRACE(3, ("\n"))
                 end
                 `TRACE(3, ("%t: [CHECKER] ================================================\n", $time))
