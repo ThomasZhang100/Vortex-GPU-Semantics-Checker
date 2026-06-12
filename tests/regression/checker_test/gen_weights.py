@@ -141,8 +141,10 @@ def main() -> None:
     p.add_argument("--mode",    choices=["identity", "ones", "saedec"], default="identity")
     p.add_argument("--hidden",  type=int, default=64,
                    help="hidden_size used in checker_test (default: 64)")
-    p.add_argument("--nfeat",   type=int, default=16,
-                   help="N_FEAT columns (default: 16)")
+    p.add_argument("--nfeat",   type=int, default=64,
+                   help="MAX_FEATURES: total SAE feature columns in the SRAM (default: 64). "
+                        "Must equal VX_checker MAX_FEATURES parameter. "
+                        "For a single-tile run set this equal to num_features.")
     p.add_argument("--maxhidden", type=int, default=2048,
                    help="MAX_HIDDEN SRAM depth (default: 2048)")
     p.add_argument("--weights", default=None,

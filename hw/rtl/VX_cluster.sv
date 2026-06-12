@@ -173,13 +173,15 @@ module VX_cluster import VX_gpu_pkg::*; #(
     logic                        checker_armed;
     logic [`MEM_ADDR_WIDTH-1:0]  checker_hidden_base_addr;
     logic [15:0]                 checker_hidden_size;
-    logic [3:0]                  checker_batch_size;
+    logic [15:0]                 checker_batch_size;
+    logic [15:0]                 checker_num_features;
 
     initial begin
         checker_armed            = 0;
         checker_hidden_base_addr = 0;
         checker_hidden_size      = 0;
         checker_batch_size       = 0;
+        checker_num_features     = 0;
     end
 
     always @(posedge clk) begin
@@ -196,7 +198,9 @@ module VX_cluster import VX_gpu_pkg::*; #(
                 `VX_DCR_CHECKER_HIDDEN_SIZE:
                     checker_hidden_size                         <= dcr_bus_if.write_data[15:0];
                 `VX_DCR_CHECKER_BATCH_SIZE:
-                    checker_batch_size                          <= dcr_bus_if.write_data[3:0];
+                    checker_batch_size                          <= dcr_bus_if.write_data[15:0];
+                `VX_DCR_CHECKER_NUM_FEATURES:
+                    checker_num_features                        <= dcr_bus_if.write_data[15:0];
                 default:;
             endcase
         end
@@ -210,9 +214,9 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[NUM_SOCKETS * `L1_MEM_PORTS], chk_act_bus_if);
 
-    wire [3:0] checker_flag;
+    wire [15:0] checker_flag;
     VX_checker #(
-        .WEIGHT_FILE ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/sae_weights_test.hex"),
+        .WEIGHT_FILE    ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/sae_weights_test.hex"),
         .THRESHOLD_FILE ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/thresholds.hex")
     ) sem_checker (
         .clk              (clk),
@@ -220,6 +224,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .checker_armed    (checker_armed),
         .hidden_base_addr (checker_hidden_base_addr),
         .hidden_size      (checker_hidden_size),
+        .num_features     (checker_num_features),
         .batch_size       (checker_batch_size),
         .flag_o           (checker_flag),
         .act_bus_if       (chk_act_bus_if)

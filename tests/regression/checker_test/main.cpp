@@ -7,8 +7,9 @@
 #include <VX_types.h>
 #include "common.h"
 
-// Checker parameters — must match VX_checker.sv B_TILE/hidden_size
-#define B_TILE       4
+// Checker parameters
+#define NUM_TOKENS   8    // total tokens in this batch (written to VX_DCR_CHECKER_BATCH_SIZE)
+#define NUM_FEATURES 32   // total number of SAE features (written to VX_DCR_CHECKER_NUM_FEATURES)
 #define HIDDEN_SIZE  64   // FP16 elements per token (small for simulation speed)
 
 #define RT_CHECK(_expr)                                          \
@@ -25,7 +26,7 @@ uint32_t num_elems = 16;
 bool ones_activation = false;  // -o: fill activations with fp16(1.0) for ground-truth check
 
 vx_device_h device      = nullptr;
-vx_buffer_h act_buffer  = nullptr;   // FP16 activation tensor (B_TILE × HIDDEN_SIZE)
+vx_buffer_h act_buffer  = nullptr;   // FP16 activation tensor (NUM_TOKENS × HIDDEN_SIZE)
 vx_buffer_h src_buffer  = nullptr;   // kernel float input
 vx_buffer_h dst_buffer  = nullptr;   // kernel float output
 vx_buffer_h krnl_buffer = nullptr;
@@ -80,16 +81,16 @@ int main(int argc, char* argv[]) {
 
     RT_CHECK(vx_dev_open(&device));
 
-    // --- Activation buffer: B_TILE tokens × HIDDEN_SIZE FP16 elements --------
-    uint32_t act_size = B_TILE * HIDDEN_SIZE * sizeof(uint16_t);
+    // --- Activation buffer: NUM_TOKENS tokens × HIDDEN_SIZE FP16 elements --------
+    uint32_t act_size = NUM_TOKENS * HIDDEN_SIZE * sizeof(uint16_t);
     RT_CHECK(vx_mem_alloc(device, act_size, VX_MEM_READ, &act_buffer));
     uint64_t act_addr = 0;
     RT_CHECK(vx_mem_address(act_buffer, &act_addr));
 
     // Fill activations: ones mode → fp16(1.0) everywhere (expected acc = HIDDEN_SIZE per PE)
     //                   ramp mode → fp16(b*HIDDEN_SIZE + k + 1)
-    std::vector<uint16_t> h_act(B_TILE * HIDDEN_SIZE);
-    for (int b = 0; b < B_TILE; ++b) {
+    std::vector<uint16_t> h_act(NUM_TOKENS * HIDDEN_SIZE);
+    for (int b = 0; b < NUM_TOKENS; ++b) {
         for (int k = 0; k < HIDDEN_SIZE; ++k) {
             float v = ones_activation ? 1.0f : (float)(b * HIDDEN_SIZE + k + 1);
             h_act[b * HIDDEN_SIZE + k] = float_to_fp16(v);
@@ -98,7 +99,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_copy_to_dev(act_buffer, h_act.data(), 0, act_size));
 
     printf("act_buffer: dev_addr=0x%lx  size=%u bytes  (%d tokens × %d FP16 elems)\n",
-           (unsigned long)act_addr, act_size, B_TILE, HIDDEN_SIZE);
+           (unsigned long)act_addr, act_size, NUM_TOKENS, HIDDEN_SIZE);
 
     // --- Kernel src/dst buffers (float sum kernel, unchanged) -----------------
     uint32_t src_size = num_elems * sizeof(float);
@@ -121,15 +122,16 @@ int main(int argc, char* argv[]) {
 
     // --- Arm the checker (trusted deployer window, before vx_start) -----------
     printf("Arming checker: act_addr=0x%lx  hidden_size=%d  batch_size=%d\n",
-           (unsigned long)act_addr, HIDDEN_SIZE, B_TILE);
+           (unsigned long)act_addr, HIDDEN_SIZE, NUM_TOKENS);
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
                           (uint32_t)(act_addr & 0xFFFFFFFFu)));
 #ifdef XLEN_64
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
                           (uint32_t)(act_addr >> 32)));
 #endif
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE, HIDDEN_SIZE));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,  B_TILE));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE,  HIDDEN_SIZE));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,   NUM_TOKENS));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_NUM_FEATURES, NUM_FEATURES));
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, 1));
 
     printf("Launching kernel (num_elems=%u, expected_sum=%.1f)\n",
