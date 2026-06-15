@@ -9,15 +9,16 @@
 // batch_tile), runs them through sa_array with the current N_FEAT weight column slice,
 // then on scan_done compares outputs against per-feature thresholds on the fly.
 //
-// row_flag[b] starts at 1 per batch_tile and ANDs across all feat_tile passes.
-// flag_o[bt*B_TILE+b] is set after the last feat_tile if all N_FEAT comparisons passed.
+// feat_count[b] accumulates per-batch_tile and ANDs across all feat_tile passes.
+// flag_o[bt*B_TILE+b] is set after the last feat_tile if feat_count > threshold[0] (k).
 //
 // Weight SRAM: MAX_HIDDEN rows × (MAX_FEATURES × 16) bits.  Each row holds all features
 // for one k value; feat_tile selects the N_FEAT-column slice before the hpipe.
-// Thresholds: MAX_FEATURES FP16 values; global feature index = feat_tile*N_FEAT + col_i.
+// Thresholds: threshold[0] = count-k (uint16); threshold[1..F] = per-feature FP16 values.
+//             Global feature index = feat_tile*N_FEAT + col_i → threshold index + 1.
 //
 // pass_reset  = rearm | next_pass        — restarts FIFOs/drain/scan each pass.
-// batch_reset = rearm | (next_pass & last_feat_tile) — resets row_flag at batch boundary.
+// batch_reset = rearm | (next_pass & last_feat_tile) — resets feat_count at batch boundary.
 //
 // Enable: -DCHECKER_ENABLE
 // DCRs:   VX_DCR_CHECKER_ENABLE       (rising edge arms checker)
@@ -49,7 +50,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     input  wire [15:0]                  num_features,   // actual number of SAE features
     input  wire [15:0]                  batch_size,     // total tokens across all batch tiles
 
-    // Per-row flags: flag_o[bt*B_TILE+b]=1 if all features of that token passed threshold.
+    // Per-row flags: flag_o[bt*B_TILE+b]=1 if feat_count > threshold[0] (count-k).
     // Rows at or beyond batch_size are always 0.
     output wire [MAX_BATCH-1:0]         flag_o,
 
@@ -82,6 +83,7 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     localparam SCAN_INIT       = N_FEAT + B_TILE - 1;
     localparam SCAN_CTR_W      = `CLOG2(SCAN_INIT + 2);
+    localparam FEAT_COUNT_W    = `CLOG2(MAX_FEATURES + 1); // counts 0..MAX_FEATURES
 
     localparam MAX_FEAT_TILES  = MAX_FEATURES / N_FEAT;
     localparam MAX_BATCH_TILES = MAX_BATCH    / B_TILE;
@@ -295,13 +297,13 @@ module VX_checker import VX_gpu_pkg::*; #(
         .rdata (weight_row_out)
     );
 
-    // Per-feature FP16 thresholds: MAX_FEATURES values loaded from THRESHOLD_FILE at init.
-    // If THRESHOLD_FILE is empty, all thresholds default to +0 (every positive value passes).
-    // Threshold array: always zero-initialized first so entries beyond num_features
-    // are 0 (not X) even when the hex file has fewer than MAX_FEATURES lines.
-    logic [15:0] threshold [0:MAX_FEATURES-1];
+    // threshold[0]:              count threshold k (raw uint16, not FP16).
+    //                            global_flag fires when feat_count > k.
+    // threshold[1..num_features]: per-feature FP16 activation thresholds.
+    // Zero-initialized so entries beyond num_features are 0 (not X).
+    logic [15:0] threshold [0:MAX_FEATURES];
     initial begin
-        for (int n = 0; n < MAX_FEATURES; n++) threshold[n] = '0;
+        for (int n = 0; n <= MAX_FEATURES; n++) threshold[n] = '0;
         if (THRESHOLD_FILE != "") $readmemh(THRESHOLD_FILE, threshold);
     end
 
@@ -420,31 +422,45 @@ module VX_checker import VX_gpu_pkg::*; #(
     );
 
     // -------------------------------------------------------------------------
-    // FP16 greater-than for non-negative thresholds.
-    // Negative a (sign bit set) is always below any non-negative threshold.
-    // Negative threshold: every non-negative activation trivially passes.
-    // For two non-negative FP16 values, IEEE 754 ordering matches unsigned bit ordering.
+    // FP16 greater-than: full IEEE 754 signed comparison including NaN.
+    // Maps each value to an unsigned sort key that preserves total order:
+    //   negative → ~x  (flips magnitude ordering for negative sign-magnitude)
+    //   positive → x ^ 0x8000  (sets MSB so all positives sort above negatives)
+    // NaN on either side returns false (IEEE unordered convention).
+    // ±0 are treated as equal (both have zero exponent+mantissa).
     // -------------------------------------------------------------------------
+    function automatic logic [15:0] fp16_order_key(input logic [15:0] x);
+        if (x[15]) return ~x;
+        else       return x ^ 16'h8000;
+    endfunction
+
+    function automatic logic fp16_is_nan(input logic [15:0] x);
+        return (x[14:10] == 5'h1F) && (x[9:0] != 10'h000);
+    endfunction
+
     function automatic logic fp16_gt(input logic [15:0] a, input logic [15:0] th);
-        if (a[15])  return 1'b0;
-        if (th[15]) return 1'b1;
-        return a[14:0] > th[14:0];
+        if (fp16_is_nan(a) || fp16_is_nan(th)) return 1'b0;
+        if (a[14:0] == 15'h0000 && th[14:0] == 15'h0000) return 1'b0;  // ±0 equal
+        return fp16_order_key(a) > fp16_order_key(th);
     endfunction
 
     // -------------------------------------------------------------------------
-    // Per-row flag: ANDs comparisons across feat_tiles; resets at batch boundaries.
+    // Per-row feature-fire counter: counts how many features exceeded their
+    // threshold.  Accumulates across feat_tiles; resets at batch boundaries.
+    // global_flag fires when feat_count > threshold[0] (the count threshold k).
     // -------------------------------------------------------------------------
-    logic [B_TILE-1:0] row_flag;
+    logic [B_TILE-1:0][FEAT_COUNT_W-1:0] feat_count;
     always_ff @(posedge clk) begin
         if (reset || batch_reset) begin
-            row_flag <= '1;
+            feat_count <= '0;
         end else if (sa_cscan_en) begin
             for (int b = 0; b < B_TILE; b++) begin
                 automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
                 if (col_i >= 0 && col_i < N_FEAT) begin
                     automatic int gf = int'(feat_tile) * N_FEAT + col_i;
-                    if (gf < int'(num_features) && !fp16_gt(sa_c_out[b], threshold[gf]))
-                        row_flag[b] <= 1'b0;
+                    // threshold[gf+1]: feature thresholds start at index 1
+                    if (gf < int'(num_features) && fp16_gt(sa_c_out[b], threshold[gf + 1]))
+                        feat_count[b] <= feat_count[b] + FEAT_COUNT_W'(1);
                 end
             end
         end
@@ -457,6 +473,7 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     // -------------------------------------------------------------------------
     // Global flag: MAX_BATCH wide. Written on last feat_tile of each batch_tile.
+    // Fires when feat_count > threshold[0] (count threshold k, raw uint16).
     // -------------------------------------------------------------------------
     logic [MAX_BATCH-1:0] global_flag;
     always_ff @(posedge clk) begin
@@ -466,7 +483,8 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int b = 0; b < B_TILE; b++) begin
                 automatic int gb = int'(batch_tile) * B_TILE + b;
                 if (gb < MAX_BATCH)
-                    global_flag[gb] <= row_flag[b] && (gb < int'(batch_size));
+                    global_flag[gb] <= (gb < int'(batch_size)) &&
+                                       (feat_count[b] > FEAT_COUNT_W'(threshold[0]));
             end
         end
     end
@@ -566,6 +584,23 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     end
 
+    // Per-token feature-fire count, captured at last feat_tile of each batch_tile.
+    // feat_count is not reset after the last pass, so full_feat_count[last_bt_rows]
+    // holds committed values when all_done_r fires.
+    logic [MAX_BATCH-1:0][FEAT_COUNT_W-1:0] full_feat_count;
+    always_ff @(posedge clk) begin
+        if (reset || rearm) begin
+            for (int gb = 0; gb < MAX_BATCH; gb++)
+                full_feat_count[gb] <= '0;
+        end else if (scan_done_pulse && last_feat_tile) begin
+            for (int b = 0; b < B_TILE; b++) begin
+                automatic int gb = int'(batch_tile) * B_TILE + b;
+                if (gb < int'(batch_size))
+                    full_feat_count[gb] <= feat_count[b];
+            end
+        end
+    end
+
     // Accumulate completed passes into a full [MAX_BATCH × MAX_FEATURES] matrix.
     // Reads pre-reset scan_capture (NBA semantics guarantee pre-edge value).
     logic [MAX_BATCH-1:0][MAX_FEATURES-1:0][15:0] full_matrix_capture;
@@ -580,7 +615,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                 for (int n = 0; n < N_FEAT; n++) begin
                     automatic int gb = int'(batch_tile) * B_TILE + b;
                     automatic int gf = int'(feat_tile)  * N_FEAT + n;
-                    if (gb < MAX_BATCH && gf < MAX_FEATURES)
+                    if (gb < int'(batch_size) && gf < int'(num_features))
                         full_matrix_capture[gb][gf] <= scan_capture[b][n];
                 end
             end
@@ -631,8 +666,11 @@ module VX_checker import VX_gpu_pkg::*; #(
                 `TRACE(3, ("%t: [CHECKER] scan  cnt=%0d  sa_c_out[0]=0x%0h  sa_c_out[%0d]=0x%0h\n",
                     $time, scan_cnt, sa_c_out[0], B_TILE-1, sa_c_out[B_TILE-1]))
             if (scan_done_pulse) begin
-                `TRACE(3, ("%t: [CHECKER] scan_done  bt=%0d ft=%0d  row_flag=0x%0x  last_ft=%0b last_bt=%0b\n",
-                    $time, batch_tile, feat_tile, row_flag, last_feat_tile, last_batch_tile))
+                `TRACE(3, ("%t: [CHECKER] scan_done  bt=%0d ft=%0d  last_ft=%0b last_bt=%0b  feat_count:",
+                    $time, batch_tile, feat_tile, last_feat_tile, last_batch_tile))
+                for (int b = 0; b < B_TILE; b++)
+                    `TRACE(3, (" %0d", feat_count[b]))
+                `TRACE(3, ("\n"))
                 // Full B_TILE×N_FEAT matmul output for this pass.
                 for (int b = 0; b < B_TILE; b++) begin
                     automatic int gb = int'(batch_tile) * B_TILE + b;
@@ -644,11 +682,17 @@ module VX_checker import VX_gpu_pkg::*; #(
                 end
             end
             if (scan_done_pulse && last_feat_tile && last_batch_tile)
-                `TRACE(3, ("%t: [CHECKER] ALL_DONE (full matrix dump follows in 1 cycle)\n", $time))
-            // Dump on all_done_r (1 cycle after ALL_DONE) so full_matrix_capture and
-            // global_flag have their final committed values for the last pass.
+                `TRACE(3, ("%t: [CHECKER] ALL_DONE (flag vector + full matrix dump follow in 1 cycle)\n", $time))
+            // Dump on all_done_r (1 cycle after ALL_DONE) so full_matrix_capture,
+            // full_feat_count, and global_flag have their final committed values.
             if (all_done_r) begin
-                `TRACE(3, ("%t: [CHECKER] ALL_DONE  global_flag=0x%0x\n", $time, global_flag))
+                `TRACE(3, ("%t: [CHECKER] ALL_DONE  count_thresh=%0d  global_flag=0x%0x\n",
+                           $time, threshold[0], global_flag))
+                `TRACE(3, ("%t: [CHECKER] === FLAG VECTOR (batch=%0d, features=%0d, k=%0d) ===\n",
+                           $time, batch_size, num_features, threshold[0]))
+                for (int gb = 0; gb < int'(batch_size); gb++)
+                    `TRACE(3, ("%t: [CHECKER]   tok[%0d]: flag=%0b  fired=%0d/%0d\n",
+                               $time, gb, global_flag[gb], full_feat_count[gb], num_features))
                 `TRACE(3, ("%t: [CHECKER] === FULL MATMUL OUTPUT (batch=%0d, features=%0d) ===\n",
                            $time, batch_size, num_features))
                 for (int gb = 0; gb < int'(batch_size); gb++) begin

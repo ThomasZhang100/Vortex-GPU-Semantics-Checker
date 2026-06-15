@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Generate a per-feature FP16 threshold hex file for VX_checker simulation.
+Generate the threshold hex file for VX_checker simulation.
 
-The threshold file has num_features lines, one FP16 value per line (4 hex chars).
-threshold[n] is compared against the SAE matmul output for feature n.
-A batch row is flagged only if ALL features exceed their threshold.
+File format (num_features + 1 lines, one uint16 per line as 4 hex chars):
+  line 0:          count threshold k (raw uint16) — global_flag fires when
+                   feat_count > k, i.e. more than k features exceeded their
+                   per-feature threshold.
+  lines 1..N:      per-feature FP16 activation thresholds for features 0..N-1.
 
-num_features  — total number of SAE features; must equal VX_DCR_CHECKER_NUM_FEATURES
-                and be ≤ VX_checker MAX_FEATURES parameter.
+k=0  → flag whenever at least 1 feature fires
+k=N  → flag only when all N features fire (strictest; equivalent to old AND logic)
 
 Modes:
-  --mode zeros    All thresholds = 0.0 (every positive activation passes; useful for testing)
-  --mode value    All thresholds = --value (single constant applied to every feature)
+  --mode zeros    All per-feature thresholds = 0.0
+  --mode value    All per-feature thresholds = --value (constant)
   --mode file     Load per-feature thresholds from a .npy file (shape [num_features])
 
 Usage:
-  python3 gen_thresholds.py --mode zeros  --num-features 16  --out thresholds.hex
-  python3 gen_thresholds.py --mode value  --value 0.5 --num-features 64  --out thresholds.hex
-  python3 gen_thresholds.py --mode file   --weights thresholds.npy  --out thresholds.hex
+  python3 gen_thresholds.py --mode zeros  --num-features 16 --count-threshold 0 --out t.hex
+  python3 gen_thresholds.py --mode value  --value 0.5 --num-features 64 --count-threshold 8 --out t.hex
+  python3 gen_thresholds.py --mode file   --weights thresholds.npy --count-threshold 4 --out t.hex
 """
 
 import argparse
@@ -46,48 +48,57 @@ def gen_from_npy(path: str, num_features: int) -> list[int]:
     return [int(np.float16(v).view(np.uint16)) for v in arr]
 
 
-def write_hex(thresholds: list[int], out_path: str) -> None:
+def write_hex(count_k: int, feature_thresholds: list[int], out_path: str) -> None:
+    entries = [count_k] + feature_thresholds
     with open(out_path, "w") as f:
-        for bits in thresholds:
+        for bits in entries:
             f.write(f"{bits:04x}\n")
-    print(f"Wrote {len(thresholds)} thresholds → {out_path}")
+    print(f"Wrote {len(entries)} entries (1 count header + {len(feature_thresholds)} features) → {out_path}")
 
 
-def verify(thresholds: list[int]) -> None:
-    print("Thresholds (decoded):")
-    for n, bits in enumerate(thresholds):
+def verify(count_k: int, feature_thresholds: list[int]) -> None:
+    print(f"  threshold[0] = {count_k}  (count threshold k — flag when fired > {count_k})")
+    print("Per-feature thresholds (FP16):")
+    for n, bits in enumerate(feature_thresholds):
         val = np.array(bits, dtype=np.uint16).view(np.float16)
-        print(f"  threshold[{n:2d}] = 0x{bits:04x}  ({float(val):.6g})")
+        print(f"  threshold[{n + 1:2d}]  feat[{n:2d}] = 0x{bits:04x}  ({float(val):.6g})")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode",         choices=["zeros", "value", "file"], default="zeros")
-    p.add_argument("--value",        type=float, default=0.0,
-                   help="Threshold value for --mode value (default: 0.0)")
-    p.add_argument("--num-features", type=int, default=16,
-                   help="Total number of SAE features; must equal VX_DCR_CHECKER_NUM_FEATURES "
+    p.add_argument("--mode",            choices=["zeros", "value", "file"], default="zeros")
+    p.add_argument("--value",           type=float, default=0.0,
+                   help="Per-feature threshold for --mode value (default: 0.0)")
+    p.add_argument("--num-features",    type=int, default=16,
+                   help="Total SAE features; must equal VX_DCR_CHECKER_NUM_FEATURES "
                         "and be ≤ VX_checker MAX_FEATURES (default: 16)")
-    p.add_argument("--weights",      default=None,
+    p.add_argument("--count-threshold", type=int, default=0,
+                   help="Count threshold k: flag fires when feat_count > k "
+                        "(0 = flag on any hit; num_features = require all; default: 0)")
+    p.add_argument("--weights",         default=None,
                    help="Path to .npy file for --mode file (shape [num_features])")
-    p.add_argument("--out",          default="thresholds.hex",
+    p.add_argument("--out",             default="thresholds.hex",
                    help="Output hex file (default: thresholds.hex)")
     args = p.parse_args()
 
     num_features = args.num_features
+    count_k      = args.count_threshold
+
+    if count_k < 0 or count_k > num_features:
+        sys.exit(f"Error: --count-threshold {count_k} out of range [0, {num_features}]")
 
     if args.mode == "zeros":
-        thresholds = gen_zeros(num_features)
+        feature_thresholds = gen_zeros(num_features)
     elif args.mode == "value":
-        thresholds = gen_constant(args.value, num_features)
+        feature_thresholds = gen_constant(args.value, num_features)
     else:
         if args.weights is None:
             sys.exit("Error: --weights <path.npy> required for --mode file")
-        thresholds = gen_from_npy(args.weights, num_features)
+        feature_thresholds = gen_from_npy(args.weights, num_features)
 
-    write_hex(thresholds, args.out)
-    verify(thresholds)
+    write_hex(count_k, feature_thresholds, args.out)
+    verify(count_k, feature_thresholds)
 
 
 if __name__ == "__main__":
