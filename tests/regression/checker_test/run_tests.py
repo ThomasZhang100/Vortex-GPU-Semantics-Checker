@@ -18,10 +18,8 @@ are fixed at build time and must match the ranges tested here.
 
 import argparse
 import re
-import struct
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -101,8 +99,7 @@ def write_threshold_hex(count_k: int, thresholds: np.ndarray, path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 def run_sim(num_tokens: int, num_features: int, hidden_size: int,
-            cores: int = 2, trace_level: int = 3,
-            extra_app_args: str = "") -> tuple[int, str]:
+            cores: int = 2, extra_app_args: str = "") -> tuple[int, str]:
     """
     Run blackbox.sh and return (returncode, combined_stdout_stderr).
     blackbox.sh is invoked from BUILD_DIR so toolchain_env.sh is already
@@ -118,7 +115,6 @@ def run_sim(num_tokens: int, num_features: int, hidden_size: int,
         f"--cores={cores}",
         "--app=checker_test",
         f"--args={app_args}",
-        f"--debug={trace_level}",
     ]
     result = subprocess.run(
         cmd,
