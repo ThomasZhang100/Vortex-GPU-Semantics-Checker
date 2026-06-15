@@ -17,6 +17,7 @@ are fixed at build time and must match the ranges tested here.
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -116,9 +117,12 @@ def run_sim(num_tokens: int, num_features: int, hidden_size: int,
         "--app=checker_test",
         f"--args={app_args}",
     ]
+    env = os.environ.copy()
+    env["CONFIGS"] = "-DCHECKER_ENABLE"
     result = subprocess.run(
         cmd,
         cwd=BUILD_DIR,
+        env=env,
         capture_output=True,
         text=True,
         timeout=300,
