@@ -357,10 +357,10 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
         if bad:
             matrix_ok = False
             print(f"  FAIL: {len(bad)} matrix element(s) differ by more than {max_ulp} ULP:")
-            for b, f, rv, tv, ulp in bad[:50]:   # cap at 8 lines
+            for b, f, rv, tv, ulp in bad[:200]:   # cap at 8 lines
                 print(f"    tok[{b}] feat[{f}]: ref={rv:.6g}  rtl={tv:.6g}  ulp_dist={ulp}")
-            if len(bad) > 50:
-                print(f"    ... ({len(bad) - 50} more)")
+            if len(bad) > 200:
+                print(f"    ... ({len(bad) - 200} more)")
         else:
             max_seen = max(
                 fp16_ulp_distance(float(ref_matrix[b, f]), float(rtl_matrix[b, f]))
