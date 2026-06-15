@@ -47,6 +47,17 @@ MAX_FEATURES = 64
 # Reference computation (mirrors RTL FP16 matmul + threshold logic)
 # ---------------------------------------------------------------------------
 
+def print_fp16_hex_matrix(name, x):
+    x16 = np.asarray(x, dtype=np.float16)
+    u16 = x16.view(np.uint16)
+
+    print(f"{name} decimal:")
+    print(x16)
+
+    print(f"{name} hex:")
+    for row in np.atleast_2d(u16):
+        print("  " + " ".join(f"0x{v:04x}" for v in row))
+
 def fp16_matmul(activations: np.ndarray, weights: np.ndarray) -> np.ndarray:
     """
     Accumulate step-by-step in FP16 to match the RTL's non-FMA systolic array:
@@ -317,14 +328,15 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
         print("  activations matrix [tokens, features]:")
         print(tc.activations)
 
-        print("  weights matrix [features, hidden]:")
-        print(tc.weights)
+        print("  weights.T matrix [hidden, features]:")
+        print(tc.weights.T)
 
         print("  ref_matrix = activations @ weights [tokens, hidden]:")
         print(ref_matrix)
 
-        print("  thresholds [hidden]:")
-        print(tc.thresholds)
+        print_fp16_hex_matrix("activations", tc.activations)
+        print_fp16_hex_matrix("weights.T", tc.weights.T)
+        print_fp16_hex_matrix("ref_matrix", ref_matrix)
 
     # Run simulation
     try:
