@@ -49,17 +49,22 @@ MAX_FEATURES = 64
 
 def fp16_matmul(activations: np.ndarray, weights: np.ndarray) -> np.ndarray:
     """
-    activations: [batch, hidden]  float32 (will be cast to fp16 internally)
-    weights:     [hidden, nfeat]  float32
-    Returns:     [batch, nfeat]   float32 (fp16 precision)
+    Accumulate step-by-step in FP16 to match the RTL's non-FMA systolic array:
+      acc = fp16(acc + fp16(a[k] * w[k]))   for k = 0..hidden-1
+    Explicit .astype(np.float16) forces IEEE 754 half-precision rounding at each
+    step rather than letting numpy silently widen to float32 internally.
+
+    activations: [batch, hidden]  — cast to fp16 before use
+    weights:     [hidden, nfeat]  — cast to fp16 before use
+    Returns:     [batch, nfeat]   fp16 array
     """
     a16 = activations.astype(np.float16)
     w16 = weights.astype(np.float16)
-    # Accumulate in fp16 to match RTL (each MAC is fp16)
-    out = np.zeros((a16.shape[0], w16.shape[1]), dtype=np.float32)
+    out = np.zeros((a16.shape[0], w16.shape[1]), dtype=np.float16)
     for k in range(a16.shape[1]):
-        out += (a16[:, k:k+1] * w16[k:k+1, :]).astype(np.float32)
-    return out.astype(np.float16)
+        prod = (a16[:, k:k+1] * w16[k:k+1, :]).astype(np.float16)
+        out  = (out + prod).astype(np.float16)
+    return out
 
 
 def reference_flags(activations: np.ndarray, weights: np.ndarray,
@@ -178,6 +183,65 @@ def parse_fired_counts(output: str, batch_size: int) -> Optional[list[int]]:
     return [counts.get(i, 0) for i in range(batch_size)]
 
 
+def parse_full_matrix(output: str, batch_size: int,
+                      num_features: int) -> Optional[np.ndarray]:
+    """Parse the === FULL MATMUL OUTPUT === block.
+
+    Returns float32 [batch, num_features], or None if the block is absent.
+    Lines in the block look like:
+        <time>: [CHECKER]   tok[N]: 2080 0 -0.5 ...   (%g-formatted FP16 values)
+    The FLAG VECTOR block has the same tok[N]: prefix but starts with 'flag=',
+    so scoping to the FULL MATMUL OUTPUT section avoids cross-contamination.
+    """
+    start = output.find("=== FULL MATMUL OUTPUT")
+    if start == -1:
+        return None
+    end = output.find("================================================", start)
+    block = output[start:end] if end != -1 else output[start:]
+
+    matrix: dict[int, np.ndarray] = {}
+    tok_re = re.compile(r'tok\[(\d+)\]:\s+(.*)')
+    for m in tok_re.finditer(block):
+        tok = int(m.group(1))
+        if tok >= batch_size:
+            continue
+        try:
+            vals = list(map(float, m.group(2).split()))
+            matrix[tok] = np.array(vals[:num_features], dtype=np.float32)
+        except ValueError:
+            pass
+
+    if len(matrix) < batch_size:
+        return None
+    result = np.zeros((batch_size, num_features), dtype=np.float32)
+    for tok, row in matrix.items():
+        result[tok, :len(row)] = row
+    return result
+
+
+def fp16_ulp_distance(a: float, b: float) -> int:
+    """Integer ULP distance between two values in FP16 bit-space.
+
+    Uses the sign-magnitude → total-order mapping:
+      positive x  →  int(x_bits)          (natural ordering)
+      negative x  → -int(x_bits & 0x7FFF) (flip so more-negative = smaller)
+
+    This means ±0 are 0 ULPs apart, and the smallest positive and negative
+    subnormals are 2 ULPs apart (through ±0).  NaN is treated as equal to NaN
+    and maximally far from anything else.
+    """
+    def to_ordered(v: float) -> int:
+        bits = int(np.float16(v).view(np.uint16))
+        return -(bits & 0x7FFF) if (bits & 0x8000) else bits
+
+    af, bf = np.float16(a), np.float16(b)
+    if np.isnan(af) and np.isnan(bf):
+        return 0
+    if np.isnan(af) or np.isnan(bf):
+        return 0x7FFF  # maximally far
+    return abs(to_ordered(float(af)) - to_ordered(float(bf)))
+
+
 # ---------------------------------------------------------------------------
 # Test case definition
 # ---------------------------------------------------------------------------
@@ -227,7 +291,7 @@ class TestCase:
 # Run one test case
 # ---------------------------------------------------------------------------
 
-def run_case(tc: TestCase, verbose: bool = False) -> bool:
+def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     print(f"\n{'='*60}")
     print(f"TEST: {tc.name}")
     print(f"  tokens={tc.num_tokens}  features={tc.num_features}  "
@@ -238,8 +302,9 @@ def run_case(tc: TestCase, verbose: bool = False) -> bool:
     write_threshold_hex(tc.count_k, tc.thresholds, THRESH_HEX)
     write_act_bin(tc.activations, ACT_BIN)
 
-    # Compute reference using the same FP16 activations that will be injected
-    expected = reference_flags(tc.activations, tc.weights, tc.thresholds, tc.count_k)
+    # Compute reference (fp16_matmul accumulates in FP16, matching the RTL MAC chain)
+    ref_matrix  = fp16_matmul(tc.activations, tc.weights)          # [B, F] fp16
+    expected    = reference_flags(tc.activations, tc.weights, tc.thresholds, tc.count_k)
     print(f"  expected flags: {expected.astype(int).tolist()}")
 
     # Run simulation
@@ -275,16 +340,47 @@ def run_case(tc: TestCase, verbose: bool = False) -> bool:
     if fired:
         print(f"  fired counts: {fired}")
 
-    # Compare
+    # --- matrix value check -------------------------------------------
+    rtl_matrix = parse_full_matrix(output, tc.num_tokens, tc.num_features)
+    matrix_ok = True
+    if rtl_matrix is None:
+        print("  WARN: FULL MATMUL OUTPUT block not found — skipping matrix check")
+    else:
+        bad: list[tuple[int, int, float, float, int]] = []
+        for b in range(tc.num_tokens):
+            for f in range(tc.num_features):
+                ref_val = float(ref_matrix[b, f])
+                rtl_val = float(rtl_matrix[b, f])
+                ulp     = fp16_ulp_distance(ref_val, rtl_val)
+                if ulp > max_ulp:
+                    bad.append((b, f, ref_val, rtl_val, ulp))
+        if bad:
+            matrix_ok = False
+            print(f"  FAIL: {len(bad)} matrix element(s) differ by more than {max_ulp} ULP:")
+            for b, f, rv, tv, ulp in bad[:8]:   # cap at 8 lines
+                print(f"    tok[{b}] feat[{f}]: ref={rv:.6g}  rtl={tv:.6g}  ulp_dist={ulp}")
+            if len(bad) > 8:
+                print(f"    ... ({len(bad) - 8} more)")
+        else:
+            max_seen = max(
+                fp16_ulp_distance(float(ref_matrix[b, f]), float(rtl_matrix[b, f]))
+                for b in range(tc.num_tokens) for f in range(tc.num_features)
+            )
+            print(f"  matrix ok  (max ULP dist = {max_seen})")
+
+    # --- flag check ---------------------------------------------------
+    flag_ok = True
     mismatches = [i for i in range(tc.num_tokens) if rtl_flags[i] != bool(expected[i])]
     if mismatches:
-        print(f"  FAIL: mismatch at token(s) {mismatches}")
+        flag_ok = False
+        print(f"  FAIL: flag mismatch at token(s) {mismatches}")
         for i in mismatches:
             print(f"    tok[{i}]: rtl={int(rtl_flags[i])} expected={int(expected[i])}")
-        return False
 
-    print("  PASS")
-    return True
+    if flag_ok and matrix_ok:
+        print("  PASS")
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +445,8 @@ def main() -> None:
                    help="Print all [CHECKER] trace lines for each test")
     p.add_argument("--filter", "-f", default=None,
                    help="Only run tests whose name contains this substring")
+    p.add_argument("--max-ulp", type=int, default=1,
+                   help="Max FP16 ULP distance allowed for matrix values (default: 1)")
     args = p.parse_args()
 
     suite = build_suite()
@@ -359,7 +457,7 @@ def main() -> None:
 
     passed, failed = 0, 0
     for tc in suite:
-        ok = run_case(tc, verbose=args.verbose)
+        ok = run_case(tc, verbose=args.verbose, max_ulp=args.max_ulp)
         if ok:
             passed += 1
         else:
