@@ -7,10 +7,10 @@
 #include <VX_types.h>
 #include "common.h"
 
-// Checker parameters
-#define NUM_TOKENS   8    // total tokens in this batch (written to VX_DCR_CHECKER_BATCH_SIZE)
-#define NUM_FEATURES 32   // total number of SAE features (written to VX_DCR_CHECKER_NUM_FEATURES)
-#define HIDDEN_SIZE  64   // FP16 elements per token (small for simulation speed)
+// Checker parameters — overridable via -T / -F / -H CLI flags
+static int NUM_TOKENS   = 8;   // total tokens (VX_DCR_CHECKER_BATCH_SIZE)
+static int NUM_FEATURES = 32;  // total SAE features (VX_DCR_CHECKER_NUM_FEATURES)
+static int HIDDEN_SIZE  = 64;  // FP16 elements per token (VX_DCR_CHECKER_HIDDEN_SIZE)
 
 #define RT_CHECK(_expr)                                          \
    do {                                                          \
@@ -49,16 +49,20 @@ static uint16_t float_to_fp16(float v) {
 
 static void show_usage() {
     std::cout << "Vortex checker test." << std::endl;
-    std::cout << "Usage: [-k kernel] [-n num_floats] [-o ones_activation] [-h help]" << std::endl;
+    std::cout << "Usage: [-k kernel] [-n num_floats] [-o ones_activation]" << std::endl;
+    std::cout << "       [-T num_tokens] [-F num_features] [-H hidden_size] [-h help]" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:oh")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:oT:F:H:h")) != -1) {
         switch (c) {
-        case 'n': num_elems = atoi(optarg);  break;
-        case 'k': kernel_file = optarg;      break;
-        case 'o': ones_activation = true;    break;
+        case 'n': num_elems     = atoi(optarg);  break;
+        case 'k': kernel_file   = optarg;        break;
+        case 'o': ones_activation = true;        break;
+        case 'T': NUM_TOKENS    = atoi(optarg);  break;
+        case 'F': NUM_FEATURES  = atoi(optarg);  break;
+        case 'H': HIDDEN_SIZE   = atoi(optarg);  break;
         case 'h': show_usage(); exit(0);
         default:  show_usage(); exit(-1);
         }
