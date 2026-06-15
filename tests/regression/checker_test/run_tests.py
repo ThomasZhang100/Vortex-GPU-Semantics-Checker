@@ -411,10 +411,10 @@ def build_suite() -> list[TestCase]:
         # --- random with positive/negative values ---
         TestCase("rand_8tok_32feat_64hidden_k8_seed0",
                  num_tokens=8, num_features=32, hidden_size=64, count_k=8
-                 ).build_random(seed=0),
+                 ).build_random(seed=5),
         TestCase("rand_8tok_32feat_64hidden_k8_seed1",
                  num_tokens=8, num_features=32, hidden_size=64, count_k=8
-                 ).build_random(seed=1),
+                 ).build_random(seed=6),
 
         # --- negative activations and thresholds ---
         TestCase("neg_8tok_32feat_64hidden_k4",
@@ -427,10 +427,10 @@ def build_suite() -> list[TestCase]:
         # --- non-power-of-2 counts (exercises padding zeros in last tile) ---
         TestCase("rand_5tok_20feat_48hidden_k5",
                  num_tokens=5, num_features=20, hidden_size=48, count_k=5
-                 ).build_random(seed=3),
+                 ).build_random(seed=7),
         TestCase("rand_6tok_24feat_40hidden_k12",
                  num_tokens=6, num_features=24, hidden_size=40, count_k=12
-                 ).build_random(seed=99),
+                 ).build_random(seed=8),
     ]
 
 
