@@ -35,9 +35,12 @@ BUILD_DIR  = REPO_ROOT / "build"
 TEST_DIR   = Path(__file__).parent
 WEIGHT_HEX = TEST_DIR / "sae_weights_test.hex"
 THRESH_HEX = TEST_DIR / "thresholds.hex"
-GEN_W      = TEST_DIR / "gen_weights.py"
-GEN_T      = TEST_DIR / "gen_thresholds.py"
+ACT_BIN    = TEST_DIR / "act_test.bin"   # FP16 activation binary injected via -A
 BLACKBOX   = BUILD_DIR / "ci" / "blackbox.sh"
+
+# Must match the compiled RTL parameter VX_checker MAX_FEATURES.
+# Each SRAM row is MAX_FEATURES FP16 values wide; $readmemh reads one row per line.
+MAX_FEATURES = 64
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +79,28 @@ def reference_flags(activations: np.ndarray, weights: np.ndarray,
 # Hex file generation helpers (delegates to gen_weights.py / gen_thresholds.py)
 # ---------------------------------------------------------------------------
 
-def write_weight_hex(weights: np.ndarray, path: Path) -> None:
-    """weights: [hidden, nfeat] float32 → write as FP16 hex (row-major, all features per row)."""
+def write_weight_hex(weights: np.ndarray, path: Path,
+                     max_features: int = MAX_FEATURES) -> None:
+    """Write one SRAM row per line: all max_features FP16 values packed as one hex word.
+
+    Feature n occupies bits [n*16+15 : n*16] (feature 0 = LSB).
+    $readmemh reads MSB-first, so the hex string is feature[max_features-1]...feature[0].
+    Features beyond weights.shape[1] are zero-padded.
+    """
     hidden, nfeat = weights.shape
+    hex_chars = max_features * 4   # bits per row / 4
     with open(path, "w") as f:
         for k in range(hidden):
+            word = 0
             for n in range(nfeat):
                 bits = int(np.float16(weights[k, n]).view(np.uint16))
-                f.write(f"{bits:04x}\n")
+                word |= (bits & 0xFFFF) << (n * 16)
+            f.write(f"{word:0{hex_chars}x}\n")
+
+
+def write_act_bin(activations: np.ndarray, path: Path) -> None:
+    """Write FP16 activations as a raw binary file (row-major, matched by -A in main.cpp)."""
+    activations.astype(np.float16).tofile(path)
 
 
 def write_threshold_hex(count_k: int, thresholds: np.ndarray, path: Path) -> None:
@@ -100,13 +117,17 @@ def write_threshold_hex(count_k: int, thresholds: np.ndarray, path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 def run_sim(num_tokens: int, num_features: int, hidden_size: int,
+            act_bin: Optional[Path] = None,
             cores: int = 2, extra_app_args: str = "") -> tuple[int, str]:
     """
     Run blackbox.sh and return (returncode, combined_stdout_stderr).
     blackbox.sh is invoked from BUILD_DIR so toolchain_env.sh is already
     sourced in the environment (caller must ensure that, or add it here).
+    act_bin: if provided, passed as -A <path> to inject arbitrary FP16 activations.
     """
     app_args = f"-T {num_tokens} -F {num_features} -H {hidden_size}"
+    if act_bin is not None:
+        app_args += f" -A {act_bin}"
     if extra_app_args:
         app_args += " " + extra_app_args
 
@@ -212,17 +233,19 @@ def run_case(tc: TestCase, verbose: bool = False) -> bool:
     print(f"  tokens={tc.num_tokens}  features={tc.num_features}  "
           f"hidden={tc.hidden_size}  k={tc.count_k}")
 
-    # Write hex files
+    # Write input files — activations as binary so GPU gets exactly what Python computed
     write_weight_hex(tc.weights, WEIGHT_HEX)
     write_threshold_hex(tc.count_k, tc.thresholds, THRESH_HEX)
+    write_act_bin(tc.activations, ACT_BIN)
 
-    # Compute reference
+    # Compute reference using the same FP16 activations that will be injected
     expected = reference_flags(tc.activations, tc.weights, tc.thresholds, tc.count_k)
     print(f"  expected flags: {expected.astype(int).tolist()}")
 
     # Run simulation
     try:
-        rc, output = run_sim(tc.num_tokens, tc.num_features, tc.hidden_size)
+        rc, output = run_sim(tc.num_tokens, tc.num_features, tc.hidden_size,
+                             act_bin=ACT_BIN)
     except subprocess.TimeoutExpired:
         print("  FAIL: simulation timed out")
         return False

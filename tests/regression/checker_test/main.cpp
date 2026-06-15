@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <cmath>
 #include <cstring>
@@ -24,6 +25,7 @@ static int HIDDEN_SIZE  = 64;  // FP16 elements per token (VX_DCR_CHECKER_HIDDEN
 const char* kernel_file = "kernel.vxbin";
 uint32_t num_elems = 16;
 bool ones_activation = false;  // -o: fill activations with fp16(1.0) for ground-truth check
+const char* act_file = nullptr; // -A: load FP16 activations from binary file (overrides -o)
 
 vx_device_h device      = nullptr;
 vx_buffer_h act_buffer  = nullptr;   // FP16 activation tensor (NUM_TOKENS × HIDDEN_SIZE)
@@ -49,17 +51,18 @@ static uint16_t float_to_fp16(float v) {
 
 static void show_usage() {
     std::cout << "Vortex checker test." << std::endl;
-    std::cout << "Usage: [-k kernel] [-n num_floats] [-o ones_activation]" << std::endl;
+    std::cout << "Usage: [-k kernel] [-n num_floats] [-o ones_activation] [-A act_file.bin]" << std::endl;
     std::cout << "       [-T num_tokens] [-F num_features] [-H hidden_size] [-h help]" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:oT:F:H:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:oA:T:F:H:h")) != -1) {
         switch (c) {
         case 'n': num_elems     = atoi(optarg);  break;
         case 'k': kernel_file   = optarg;        break;
         case 'o': ones_activation = true;        break;
+        case 'A': act_file      = optarg;        break;
         case 'T': NUM_TOKENS    = atoi(optarg);  break;
         case 'F': NUM_FEATURES  = atoi(optarg);  break;
         case 'H': HIDDEN_SIZE   = atoi(optarg);  break;
@@ -91,14 +94,19 @@ int main(int argc, char* argv[]) {
     uint64_t act_addr = 0;
     RT_CHECK(vx_mem_address(act_buffer, &act_addr));
 
-    // Fill activations: ones mode → fp16(1.0) everywhere (expected acc = HIDDEN_SIZE per PE)
-    //                   ramp mode → fp16(b*HIDDEN_SIZE + k + 1)
+    // Fill activations: -A file → load FP16 binary; -o → fp16(1.0); default → ramp
     std::vector<uint16_t> h_act(NUM_TOKENS * HIDDEN_SIZE);
-    for (int b = 0; b < NUM_TOKENS; ++b) {
-        for (int k = 0; k < HIDDEN_SIZE; ++k) {
-            float v = ones_activation ? 1.0f : (float)(b * HIDDEN_SIZE + k + 1);
-            h_act[b * HIDDEN_SIZE + k] = float_to_fp16(v);
-        }
+    if (act_file) {
+        std::ifstream f(act_file, std::ios::binary);
+        if (!f) { fprintf(stderr, "Error: cannot open act_file '%s'\n", act_file); cleanup(); exit(-1); }
+        f.read(reinterpret_cast<char*>(h_act.data()), act_size);
+        if (!f) { fprintf(stderr, "Error: short read from '%s' (expected %u bytes)\n", act_file, act_size); cleanup(); exit(-1); }
+    } else {
+        for (int b = 0; b < NUM_TOKENS; ++b)
+            for (int k = 0; k < HIDDEN_SIZE; ++k) {
+                float v = ones_activation ? 1.0f : (float)(b * HIDDEN_SIZE + k + 1);
+                h_act[b * HIDDEN_SIZE + k] = float_to_fp16(v);
+            }
     }
     RT_CHECK(vx_copy_to_dev(act_buffer, h_act.data(), 0, act_size));
 
