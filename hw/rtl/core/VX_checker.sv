@@ -162,10 +162,12 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     generate
         for (genvar b = 0; b < B_TILE; b++) begin : g_row_align
+            /* verilator lint_off UNUSEDSIGNAL */
             wire [`MEM_ADDR_WIDTH-1:0] row_start_byte =
                 hidden_base_addr
                 + (`MEM_ADDR_WIDTH'(batch_tile) * B_TILE + `MEM_ADDR_WIDTH'(b))
                   * `MEM_ADDR_WIDTH'(hidden_size) * 2;
+            /* verilator lint_on UNUSEDSIGNAL */
             // byte offset within the cache line, then divide by 2 for FP16
             assign row_skip[b]       = row_start_byte[LINE_BITS-1:1];
             assign per_row_chunks[b] = CHUNKS_W'(
