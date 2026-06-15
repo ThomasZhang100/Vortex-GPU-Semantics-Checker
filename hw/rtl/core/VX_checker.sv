@@ -434,9 +434,11 @@ module VX_checker import VX_gpu_pkg::*; #(
         else       return x ^ 16'h8000;
     endfunction
 
+    /* verilator lint_off UNUSEDSIGNAL */
     function automatic logic fp16_is_nan(input logic [15:0] x);
-        return (x[14:10] == 5'h1F) && (x[9:0] != 10'h000);
+        return (x[14:10] == 5'h1F) && (x[9:0] != 10'h000);  // sign bit irrelevant for NaN
     endfunction
+    /* verilator lint_on UNUSEDSIGNAL */
 
     function automatic logic fp16_gt(input logic [15:0] a, input logic [15:0] th);
         if (fp16_is_nan(a) || fp16_is_nan(th)) return 1'b0;
