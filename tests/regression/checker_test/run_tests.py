@@ -307,6 +307,25 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     expected    = reference_flags(tc.activations, tc.weights, tc.thresholds, tc.count_k)
     print(f"  expected flags: {expected.astype(int).tolist()}")
 
+    if verbose:
+        np.set_printoptions(
+            linewidth=180,
+            precision=6,
+            suppress=False
+        )
+
+        print("  activations matrix [tokens, features]:")
+        print(tc.activations)
+
+        print("  weights matrix [features, hidden]:")
+        print(tc.weights)
+
+        print("  ref_matrix = activations @ weights [tokens, hidden]:")
+        print(ref_matrix)
+
+        print("  thresholds [hidden]:")
+        print(tc.thresholds)
+
     # Run simulation
     try:
         rc, output = run_sim(tc.num_tokens, tc.num_features, tc.hidden_size,
