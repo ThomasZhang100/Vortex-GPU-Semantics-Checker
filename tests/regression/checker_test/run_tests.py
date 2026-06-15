@@ -325,15 +325,6 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
             suppress=False
         )
 
-        print("  activations matrix [tokens, features]:")
-        print(tc.activations)
-
-        print("  weights.T matrix [hidden, features]:")
-        print(tc.weights.T)
-
-        print("  ref_matrix = activations @ weights [tokens, hidden]:")
-        print(ref_matrix)
-
         print_fp16_hex_matrix("activations", tc.activations)
         print_fp16_hex_matrix("weights.T", tc.weights.T)
         print_fp16_hex_matrix("ref_matrix", ref_matrix)
