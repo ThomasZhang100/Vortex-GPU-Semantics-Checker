@@ -60,10 +60,12 @@ def print_fp16_hex_matrix(name, x):
 
 def fp16_matmul(activations: np.ndarray, weights: np.ndarray) -> np.ndarray:
     """
-    Accumulate step-by-step in FP16 to match the RTL's non-FMA systolic array:
-      acc = fp16(acc + fp16(a[k] * w[k]))   for k = 0..hidden-1
-    Explicit .astype(np.float16) forces IEEE 754 half-precision rounding at each
-    step rather than letting numpy silently widen to float32 internally.
+    Accumulate step-by-step to match the RTL's FMA systolic array (fpnew FMADD):
+      acc = fp16(fma(a[k], w[k], acc))   for k = 0..hidden-1
+    fpnew FMADD is a true fused multiply-add: a single IEEE 754 rounding on the
+    full product+addend sum.  Numpy has no native fma, so we widen to float32,
+    perform the addition there (float32 is wide enough to be exact for FP16 inputs),
+    and round the result back to float16.  This matches the RTL to within ±1 ULP.
 
     activations: [batch, hidden]  — cast to fp16 before use
     weights:     [hidden, nfeat]  — cast to fp16 before use
@@ -73,8 +75,10 @@ def fp16_matmul(activations: np.ndarray, weights: np.ndarray) -> np.ndarray:
     w16 = weights.astype(np.float16)
     out = np.zeros((a16.shape[0], w16.shape[1]), dtype=np.float16)
     for k in range(a16.shape[1]):
-        prod = (a16[:, k:k+1] * w16[k:k+1, :]).astype(np.float16)
-        out  = (out + prod).astype(np.float16)
+        a_f32  = a16[:, k:k+1].astype(np.float32)
+        w_f32  = w16[k:k+1, :].astype(np.float32)
+        acc_f32 = out.astype(np.float32)
+        out = (a_f32 * w_f32 + acc_f32).astype(np.float16)
     return out
 
 

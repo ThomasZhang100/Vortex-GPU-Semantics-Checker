@@ -148,14 +148,34 @@ module VX_checker import VX_gpu_pkg::*; #(
     end
 
     // -------------------------------------------------------------------------
-    // Configuration latched on rearm
+    // Per-row cache-line alignment skip.
+    // When a token's start byte address is not cache-line aligned the L2
+    // returns a cache line that begins before the token.  row_skip[b] is the
+    // number of FP16 elements at the head of the first cache-line response
+    // that belong to the previous token and must be discarded.
+    // per_row_chunks[b] = ceil((hidden_size + row_skip[b]) / LINE_WORDS)
+    // replaces the old shared total_chunks so each row issues exactly the
+    // right number of cache-line requests.
     // -------------------------------------------------------------------------
-    logic [CHUNKS_W-1:0] total_chunks;
+    wire [LOG_LW-1:0]   row_skip       [B_TILE];
+    wire [CHUNKS_W-1:0] per_row_chunks [B_TILE];
 
-    always_ff @(posedge clk) begin
-        if (rearm)
-            total_chunks <= CHUNKS_W'((32'(hidden_size) + LINE_WORDS - 1) >> LOG_LW);
-    end
+    generate
+        for (genvar b = 0; b < B_TILE; b++) begin : g_row_align
+            wire [`MEM_ADDR_WIDTH-1:0] row_start_byte =
+                hidden_base_addr
+                + (`MEM_ADDR_WIDTH'(batch_tile) * B_TILE + `MEM_ADDR_WIDTH'(b))
+                  * `MEM_ADDR_WIDTH'(hidden_size) * 2;
+            // byte offset within the cache line, then divide by 2 for FP16
+            assign row_skip[b]       = row_start_byte[LINE_BITS-1:1];
+            assign per_row_chunks[b] = CHUNKS_W'(
+                (32'(hidden_size) + 32'(row_skip[b]) + LINE_WORDS - 1) >> LOG_LW);
+        end
+    endgenerate
+
+    // first_chunk_done[b]: set after the first cache-line response for row b
+    // arrives in a given pass; cleared on pass_reset.
+    logic [B_TILE-1:0] first_chunk_done;
 
     // -------------------------------------------------------------------------
     // Per-row FIFO storage
@@ -242,7 +262,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                 count[b]   <= '0;
                 k_count[b] <= '0;
             end
-            k_started <= '0;
+            k_started        <= '0;
+            first_chunk_done <= '0;
         end else if (state == ACTIVE) begin
             if (!k_started[0] && (count[0] > '0))
                 k_started[0] <= 1'b1;
@@ -252,21 +273,42 @@ module VX_checker import VX_gpu_pkg::*; #(
 
             for (int b = 0; b < B_TILE; b++) begin
                 if (row_push[b]) begin
-                    for (int w = 0; w < LINE_WORDS; w++)
-                        fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w))]
-                            <= act_bus_if.rsp_data.data[w*16 +: 16];
-                    wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
+                    first_chunk_done[b] <= 1'b1;
+                    if (!first_chunk_done[b]) begin
+                        // First cache-line response: skip row_skip[b] leading FP16
+                        // elements that belong to the previous token's cache line.
+                        for (int w = 0; w < LINE_WORDS; w++) begin
+                            if (w >= int'(row_skip[b]))
+                                fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w - int'(row_skip[b])))]
+                                    <= act_bus_if.rsp_data.data[w*16 +: 16];
+                        end
+                        wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b]
+                                     + FIFO_PTR_W'(LINE_WORDS - int'(row_skip[b])));
+                    end else begin
+                        for (int w = 0; w < LINE_WORDS; w++)
+                            fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w))]
+                                <= act_bus_if.rsp_data.data[w*16 +: 16];
+                        wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
+                    end
                 end
                 if (row_pop[b]) begin
                     rd_ptr[b]  <= rd_ptr[b] + FIFO_PTR_W'(1);
                     k_count[b] <= k_count[b] + 16'(1);
                 end
-                if (row_push[b] && row_pop[b])
-                    count[b] <= FIFO_CTR_W'(count[b]) + FIFO_CTR_W'(LINE_WORDS) - FIFO_CTR_W'(1);
-                else if (row_push[b])
-                    count[b] <= FIFO_CTR_W'(count[b] + FIFO_CTR_W'(LINE_WORDS));
-                else if (row_pop[b])
-                    count[b] <= count[b] - FIFO_CTR_W'(1);
+                begin : count_update
+                    // push_words: actual FP16 elements written this push (first chunk
+                    // writes fewer if the row is not cache-line aligned).
+                    automatic logic [FIFO_CTR_W-1:0] push_words =
+                        (!first_chunk_done[b])
+                            ? FIFO_CTR_W'(LINE_WORDS - int'(row_skip[b]))
+                            : FIFO_CTR_W'(LINE_WORDS);
+                    if (row_push[b] && row_pop[b])
+                        count[b] <= FIFO_CTR_W'(count[b]) + push_words - FIFO_CTR_W'(1);
+                    else if (row_push[b])
+                        count[b] <= FIFO_CTR_W'(count[b]) + push_words;
+                    else if (row_pop[b])
+                        count[b] <= count[b] - FIFO_CTR_W'(1);
+                end
             end
         end
     end
@@ -508,7 +550,7 @@ module VX_checker import VX_gpu_pkg::*; #(
                     && !rearm
                     && (state == ACTIVE)
                     && (count[bi] <= FIFO_CTR_W'(FIFO_HALF))
-                    && (next_chunk[bi] < total_chunks)) begin
+                    && (next_chunk[bi] < per_row_chunks[bi])) begin
                 issue_row   = ROW_ID_BITS'(bi);
                 issue_valid = 1'b1;
             end
@@ -644,8 +686,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     always @(posedge clk) begin
         if (!reset && checker_armed) begin
             if (rearm)
-                `TRACE(3, ("%t: [CHECKER] armed  base=0x%0h  hidden=%0d  features=%0d  batch=%0d  chunks=%0d\n",
-                    $time, hidden_base_addr, hidden_size, num_features, batch_size, total_chunks))
+                `TRACE(3, ("%t: [CHECKER] armed  base=0x%0h  hidden=%0d  features=%0d  batch=%0d  chunks[0]=%0d\n",
+                    $time, hidden_base_addr, hidden_size, num_features, batch_size, per_row_chunks[0]))
             if (req_fire)
                 `TRACE(3, ("%t: [CHECKER] req  bt=%0d ft=%0d row=%0d chunk=%0d addr=0x%0h\n",
                     $time, batch_tile, feat_tile, issue_row, next_chunk[issue_row], req_byte_addr))
