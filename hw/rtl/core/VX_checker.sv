@@ -491,6 +491,25 @@ module VX_checker import VX_gpu_pkg::*; #(
     endfunction
 
     // -------------------------------------------------------------------------
+    // row_fired_now[b]: the actual hardware firing decision for whatever
+    // feature column b is scanning out this cycle (fp16_gt against its
+    // threshold).  Factored out of the feat_count update so simulation-only
+    // tracing can observe the exact bit the comparator produced, rather than
+    // recomputing it in software from the dumped accumulator value.
+    // -------------------------------------------------------------------------
+    logic [B_TILE-1:0] row_fired_now;
+    always_comb begin
+        for (int b = 0; b < B_TILE; b++) begin
+            automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
+            automatic int gf    = int'(feat_tile) * N_FEAT + col_i;
+            // threshold[gf+1]: feature thresholds start at index 1
+            row_fired_now[b] = (col_i >= 0) && (col_i < N_FEAT) &&
+                                (gf < int'(num_features)) &&
+                                fp16_gt(sa_c_out[b], threshold[gf + 1]);
+        end
+    end
+
+    // -------------------------------------------------------------------------
     // Per-row feature-fire counter: counts how many features exceeded their
     // threshold.  Accumulates across feat_tiles; resets at batch boundaries.
     // global_flag fires when feat_count > threshold[0] (the count threshold k).
@@ -501,13 +520,8 @@ module VX_checker import VX_gpu_pkg::*; #(
             feat_count <= '0;
         end else if (sa_cscan_en) begin
             for (int b = 0; b < B_TILE; b++) begin
-                automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
-                if (col_i >= 0 && col_i < N_FEAT) begin
-                    automatic int gf = int'(feat_tile) * N_FEAT + col_i;
-                    // threshold[gf+1]: feature thresholds start at index 1
-                    if (gf < int'(num_features) && fp16_gt(sa_c_out[b], threshold[gf + 1]))
-                        feat_count[b] <= feat_count[b] + FEAT_COUNT_W'(1);
-                end
+                if (row_fired_now[b])
+                    feat_count[b] <= feat_count[b] + FEAT_COUNT_W'(1);
             end
         end
     end
@@ -618,14 +632,21 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Capture the full B_TILE×N_FEAT matmul output during the scan phase.
     // col_i for row b at scan_cnt = SCAN_INIT - scan_cnt - b (same as row_flag indexing).
     logic [B_TILE-1:0][N_FEAT-1:0][15:0] scan_capture;
+    // Capture the actual per-feature fired bit (row_fired_now) alongside the
+    // raw value, so tracing reflects the hardware comparator's own decision
+    // rather than a value re-derived in software.
+    logic [B_TILE-1:0][N_FEAT-1:0]       fired_capture;
     always_ff @(posedge clk) begin
         if (reset || pass_reset) begin
-            scan_capture <= '0;
+            scan_capture  <= '0;
+            fired_capture <= '0;
         end else if (sa_cscan_en) begin
             for (int b = 0; b < B_TILE; b++) begin
                 automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
-                if (col_i >= 0 && col_i < N_FEAT)
-                    scan_capture[b][col_i] <= sa_c_out[b];
+                if (col_i >= 0 && col_i < N_FEAT) begin
+                    scan_capture[b][col_i]  <= sa_c_out[b];
+                    fired_capture[b][col_i] <= row_fired_now[b];
+                end
             end
         end
     end
@@ -650,19 +671,25 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Accumulate completed passes into a full [MAX_BATCH × MAX_FEATURES] matrix.
     // Reads pre-reset scan_capture (NBA semantics guarantee pre-edge value).
     logic [MAX_BATCH-1:0][MAX_FEATURES-1:0][15:0] full_matrix_capture;
+    // Same accumulation for the actual hardware fired bit, not a recomputation.
+    logic [MAX_BATCH-1:0][MAX_FEATURES-1:0]       full_fired_capture;
     always_ff @(posedge clk) begin
         if (reset || rearm) begin
             // Element-wise clear avoids >8K-bit replication (Verilator WIDTHCONCAT).
             for (int gb = 0; gb < MAX_BATCH; gb++)
-                for (int gf = 0; gf < MAX_FEATURES; gf++)
+                for (int gf = 0; gf < MAX_FEATURES; gf++) begin
                     full_matrix_capture[gb][gf] <= '0;
+                    full_fired_capture[gb][gf]  <= '0;
+                end
         end else if (scan_done_pulse) begin
             for (int b = 0; b < B_TILE; b++) begin
                 for (int n = 0; n < N_FEAT; n++) begin
                     automatic int gb = int'(batch_tile) * B_TILE + b;
                     automatic int gf = int'(feat_tile)  * N_FEAT + n;
-                    if (gb < int'(batch_size) && gf < int'(num_features))
+                    if (gb < int'(batch_size) && gf < int'(num_features)) begin
                         full_matrix_capture[gb][gf] <= scan_capture[b][n];
+                        full_fired_capture[gb][gf]  <= fired_capture[b][n];
+                    end
                 end
             end
         end
@@ -745,6 +772,19 @@ module VX_checker import VX_gpu_pkg::*; #(
                     `TRACE(3, ("%t: [CHECKER]   tok[%0d]:", $time, gb))
                     for (int gf = 0; gf < int'(num_features); gf++)
                         `TRACE(3, (" %g", fp16_to_real(full_matrix_capture[gb][gf])))
+                    `TRACE(3, ("\n"))
+                end
+                `TRACE(3, ("%t: [CHECKER] ================================================\n", $time))
+                // Per-feature fired bit as produced by the hardware comparator
+                // (fp16_gt, via row_fired_now) — not re-derived from the dumped
+                // matmul value.  Lets the test harness check the actual firing
+                // decision rather than recomputing threshold comparisons in Python.
+                `TRACE(3, ("%t: [CHECKER] === FIRED BITMAP (batch=%0d, features=%0d) ===\n",
+                           $time, batch_size, num_features))
+                for (int gb = 0; gb < int'(batch_size); gb++) begin
+                    `TRACE(3, ("%t: [CHECKER]   tok[%0d]:", $time, gb))
+                    for (int gf = 0; gf < int'(num_features); gf++)
+                        `TRACE(3, (" %0d", full_fired_capture[gb][gf]))
                     `TRACE(3, ("\n"))
                 end
                 `TRACE(3, ("%t: [CHECKER] ================================================\n", $time))
