@@ -14,7 +14,10 @@ static int HIDDEN_SIZE  = 64;  // K: cols of A / rows of B  (VX_DCR_CHECKER_HIDD
 static int OUT_WIDTH    = 16;  // N: cols of B / cols of C
 static int TILE_SIZE    = 4;   // sgemm2-style local-memory tile size
 
-#define FLOAT_ULP 6
+// Widened from 6: native FP32 A means the RTL's tiled/blocked accumulation
+// (kernel.cpp) and matmul_cpu's left-to-right sum reassociate ~64 terms
+// differently, drifting more ULPs apart than when A was FP16-quantized.
+#define FLOAT_ULP 128
 
 #define RT_CHECK(_expr)                                          \
    do {                                                          \
