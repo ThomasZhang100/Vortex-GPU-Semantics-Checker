@@ -112,5 +112,6 @@ clean:
 	$(MAKE) -C relu clean
 	$(MAKE) -C sgemv clean
 	$(MAKE) -C sgemm2 clean
+	$(MAKE) -C checker_test clean
 	$(MAKE) -C madmax clean
 	$(MAKE) -C stencil3d clean
