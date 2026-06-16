@@ -8,10 +8,14 @@
 #include <VX_types.h>
 #include "common.h"
 
-// Checker parameters — overridable via -T / -F / -H CLI flags
-static int NUM_TOKENS   = 8;   // total tokens (VX_DCR_CHECKER_BATCH_SIZE)
+// Checker / GEMM parameters — overridable via CLI flags.
+static int NUM_TOKENS   = 8;   // M: rows of A / rows of C  (VX_DCR_CHECKER_BATCH_SIZE)
 static int NUM_FEATURES = 32;  // total SAE features (VX_DCR_CHECKER_NUM_FEATURES)
-static int HIDDEN_SIZE  = 64;  // FP16 elements per token (VX_DCR_CHECKER_HIDDEN_SIZE)
+static int HIDDEN_SIZE  = 64;  // K: cols of A / rows of B  (VX_DCR_CHECKER_HIDDEN_SIZE)
+static int OUT_WIDTH    = 16;  // N: cols of B / cols of C
+static int TILE_SIZE    = 4;   // sgemm2-style local-memory tile size
+
+#define FLOAT_ULP 6
 
 #define RT_CHECK(_expr)                                          \
    do {                                                          \
@@ -22,20 +26,10 @@ static int HIDDEN_SIZE  = 64;  // FP16 elements per token (VX_DCR_CHECKER_HIDDEN
      exit(-1);                                                   \
    } while (false)
 
-const char* kernel_file = "kernel.vxbin";
-uint32_t num_elems = 16;
-bool ones_activation = false;  // -o: fill activations with fp16(1.0) for ground-truth check
-const char* act_file = nullptr; // -A: load FP16 activations from binary file (overrides -o)
+///////////////////////////////////////////////////////////////////////////////
 
-vx_device_h device      = nullptr;
-vx_buffer_h act_buffer  = nullptr;   // FP16 activation tensor (NUM_TOKENS × HIDDEN_SIZE)
-vx_buffer_h src_buffer  = nullptr;   // kernel float input
-vx_buffer_h dst_buffer  = nullptr;   // kernel float output
-vx_buffer_h krnl_buffer = nullptr;
-vx_buffer_h args_buffer = nullptr;
-kernel_arg_t kernel_arg = {};
-
-// Minimal float→FP16 conversion (correct for integer-valued test data)
+// Minimal float<->FP16 conversion helpers (host side; exact, no rounding
+// modes needed for widening, and correct for the integer-valued ramp data).
 static uint16_t float_to_fp16(float v) {
     uint32_t bits;
     memcpy(&bits, &v, 4);
@@ -49,23 +43,96 @@ static uint16_t float_to_fp16(float v) {
     return (uint16_t)((sign << 15) | (exp16 << 10) | mant16);
 }
 
+static float fp16_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            int32_t e = -1;
+            do {
+                mant <<= 1;
+                ++e;
+            } while (!(mant & 0x400u));
+            mant &= 0x3FFu;
+            bits = sign | ((uint32_t)(112 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+static bool compare_float(float a, float b, int index, int errors) {
+    union fi_t { float f; int32_t i; };
+    fi_t fa, fb;
+    fa.f = a;
+    fb.f = b;
+    auto d = std::abs(fa.i - fb.i);
+    if (d > FLOAT_ULP) {
+        if (errors < 100) {
+            printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
+        }
+        return false;
+    }
+    return true;
+}
+
+// Reference sgemm: C[M x N] = A[M x K] * B[K x N], with A supplied pre-widened
+// to float (it lives in device memory as FP16, same tensor the checker taps).
+static void matmul_cpu(float* C, const float* A, const float* B,
+                        uint32_t M, uint32_t N, uint32_t K) {
+    for (uint32_t m = 0; m < M; ++m) {
+        for (uint32_t n = 0; n < N; ++n) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < K; ++k) {
+                sum += A[m * K + k] * B[k * N + n];
+            }
+            C[m * N + n] = sum;
+        }
+    }
+}
+
+const char* kernel_file = "kernel.vxbin";
+bool ones_activation = false;   // -o: fill A with fp16(1.0) for ground-truth check
+const char* act_file = nullptr; // -A: load FP16 A from binary file (overrides -o)
+
+vx_device_h device      = nullptr;
+vx_buffer_h A_buffer    = nullptr;   // [M x K] FP16 "hidden states" — also the checker's tap
+vx_buffer_h B_buffer    = nullptr;   // [K x N] FP32 weights
+vx_buffer_h C_buffer    = nullptr;   // [M x N] FP32 output
+vx_buffer_h krnl_buffer = nullptr;
+vx_buffer_h args_buffer = nullptr;
+kernel_arg_t kernel_arg = {};
+
 static void show_usage() {
-    std::cout << "Vortex checker test." << std::endl;
-    std::cout << "Usage: [-k kernel] [-n num_floats] [-o ones_activation] [-A act_file.bin]" << std::endl;
-    std::cout << "       [-T num_tokens] [-F num_features] [-H hidden_size] [-h help]" << std::endl;
+    std::cout << "Vortex checker+sgemm2 test." << std::endl;
+    std::cout << "Usage: [-k kernel] [-o ones_activation] [-A act_file.bin]" << std::endl;
+    std::cout << "       [-T num_tokens] [-F num_features] [-H hidden_size]" << std::endl;
+    std::cout << "       [-N out_width] [-t tile_size] [-h help]" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:oA:T:F:H:h")) != -1) {
+    while ((c = getopt(argc, argv, "k:oA:T:F:H:N:t:h")) != -1) {
         switch (c) {
-        case 'n': num_elems     = atoi(optarg);  break;
         case 'k': kernel_file   = optarg;        break;
         case 'o': ones_activation = true;        break;
         case 'A': act_file      = optarg;        break;
         case 'T': NUM_TOKENS    = atoi(optarg);  break;
         case 'F': NUM_FEATURES  = atoi(optarg);  break;
         case 'H': HIDDEN_SIZE   = atoi(optarg);  break;
+        case 'N': OUT_WIDTH     = atoi(optarg);  break;
+        case 't': TILE_SIZE     = atoi(optarg);  break;
         case 'h': show_usage(); exit(0);
         default:  show_usage(); exit(-1);
         }
@@ -74,9 +141,9 @@ static void parse_args(int argc, char** argv) {
 
 void cleanup() {
     if (device) {
-        vx_mem_free(act_buffer);
-        vx_mem_free(src_buffer);
-        vx_mem_free(dst_buffer);
+        vx_mem_free(A_buffer);
+        vx_mem_free(B_buffer);
+        vx_mem_free(C_buffer);
         vx_mem_free(krnl_buffer);
         vx_mem_free(args_buffer);
         vx_dev_close(device);
@@ -86,82 +153,157 @@ void cleanup() {
 int main(int argc, char* argv[]) {
     parse_args(argc, argv);
 
+    if ((NUM_TOKENS  % TILE_SIZE) != 0 ||
+        (HIDDEN_SIZE % TILE_SIZE) != 0 ||
+        (OUT_WIDTH   % TILE_SIZE) != 0) {
+        fprintf(stderr, "Error: num_tokens (%d), hidden_size (%d), and out_width (%d) "
+                         "must all be multiples of tile_size (%d)\n",
+                NUM_TOKENS, HIDDEN_SIZE, OUT_WIDTH, TILE_SIZE);
+        exit(-1);
+    }
+
     RT_CHECK(vx_dev_open(&device));
 
-    // --- Activation buffer: NUM_TOKENS tokens × HIDDEN_SIZE FP16 elements --------
-    uint32_t act_size = NUM_TOKENS * HIDDEN_SIZE * sizeof(uint16_t);
-    RT_CHECK(vx_mem_alloc(device, act_size, VX_MEM_READ, &act_buffer));
-    uint64_t act_addr = 0;
-    RT_CHECK(vx_mem_address(act_buffer, &act_addr));
+    uint32_t M = NUM_TOKENS;
+    uint32_t K = HIDDEN_SIZE;
+    uint32_t N = OUT_WIDTH;
 
-    // Fill activations: -A file → load FP16 binary; -o → fp16(1.0); default → ramp
-    std::vector<uint16_t> h_act(NUM_TOKENS * HIDDEN_SIZE);
+    uint32_t group_size = TILE_SIZE * TILE_SIZE;
+    uint32_t local_mem   = 2 * group_size * sizeof(float);
+    uint32_t max_localmem;
+    RT_CHECK(vx_check_occupancy(device, group_size, &max_localmem));
+    std::cout << "occupancy: max_localmem=" << max_localmem << " bytes (need " << local_mem << ")" << std::endl;
+    if (local_mem > max_localmem) {
+        fprintf(stderr, "Error: tile_size=%d needs %u bytes of local memory, device supports only %u\n",
+                TILE_SIZE, local_mem, max_localmem);
+        cleanup();
+        exit(-1);
+    }
+
+    // --- A buffer: [M x K] FP16 "hidden states" — both the GEMM input and the
+    // exact tensor the checker independently taps off L2 (see arming below). --
+    uint32_t a_size = M * K * sizeof(uint16_t);
+    RT_CHECK(vx_mem_alloc(device, a_size, VX_MEM_READ, &A_buffer));
+    uint64_t A_addr = 0;
+    RT_CHECK(vx_mem_address(A_buffer, &A_addr));
+
+    // --- B buffer: [K x N] FP32 weights ----------------------------------
+    uint32_t b_size = K * N * sizeof(float);
+    RT_CHECK(vx_mem_alloc(device, b_size, VX_MEM_READ, &B_buffer));
+    uint64_t B_addr = 0;
+    RT_CHECK(vx_mem_address(B_buffer, &B_addr));
+
+    // --- C buffer: [M x N] FP32 output -------------------------------------
+    uint32_t c_size = M * N * sizeof(float);
+    RT_CHECK(vx_mem_alloc(device, c_size, VX_MEM_WRITE, &C_buffer));
+    uint64_t C_addr = 0;
+    RT_CHECK(vx_mem_address(C_buffer, &C_addr));
+
+    std::cout << "matrix A (hidden states): " << M << "x" << K << " (FP16)" << std::endl;
+    std::cout << "matrix B (weights):       " << K << "x" << N << " (FP32)" << std::endl;
+    std::cout << "matrix C (output):        " << M << "x" << N << " (FP32)" << std::endl;
+    std::cout << "tile size: " << TILE_SIZE << "x" << TILE_SIZE << "  local memory: " << local_mem << " bytes" << std::endl;
+    std::cout << "A_addr=0x" << std::hex << A_addr << "  B_addr=0x" << B_addr
+               << "  C_addr=0x" << C_addr << std::dec << std::endl;
+
+    // Fill A: -A file -> load FP16 binary; -o -> fp16(1.0); default -> ramp.
+    std::vector<uint16_t> h_A(M * K);
     if (act_file) {
         std::ifstream f(act_file, std::ios::binary);
         if (!f) { fprintf(stderr, "Error: cannot open act_file '%s'\n", act_file); cleanup(); exit(-1); }
-        f.read(reinterpret_cast<char*>(h_act.data()), act_size);
-        if (!f) { fprintf(stderr, "Error: short read from '%s' (expected %u bytes)\n", act_file, act_size); cleanup(); exit(-1); }
+        f.read(reinterpret_cast<char*>(h_A.data()), a_size);
+        if (!f) { fprintf(stderr, "Error: short read from '%s' (expected %u bytes)\n", act_file, a_size); cleanup(); exit(-1); }
     } else {
-        for (int b = 0; b < NUM_TOKENS; ++b)
-            for (int k = 0; k < HIDDEN_SIZE; ++k) {
-                float v = ones_activation ? 1.0f : (float)(b * HIDDEN_SIZE + k + 1);
-                h_act[b * HIDDEN_SIZE + k] = float_to_fp16(v);
+        for (uint32_t m = 0; m < M; ++m)
+            for (uint32_t k = 0; k < K; ++k) {
+                float v = ones_activation ? 1.0f : (float)(m * K + k + 1);
+                h_A[m * K + k] = float_to_fp16(v);
             }
     }
-    RT_CHECK(vx_copy_to_dev(act_buffer, h_act.data(), 0, act_size));
 
-    printf("act_buffer: dev_addr=0x%lx  size=%u bytes  (%d tokens × %d FP16 elems)\n",
-           (unsigned long)act_addr, act_size, NUM_TOKENS, HIDDEN_SIZE);
-
-    // --- Kernel src/dst buffers (float sum kernel, unchanged) -----------------
-    uint32_t src_size = num_elems * sizeof(float);
-    uint32_t dst_size = sizeof(float);
-    RT_CHECK(vx_mem_alloc(device, src_size, VX_MEM_READ,  &src_buffer));
-    RT_CHECK(vx_mem_address(src_buffer, &kernel_arg.src_addr));
-    RT_CHECK(vx_mem_alloc(device, dst_size, VX_MEM_WRITE, &dst_buffer));
-    RT_CHECK(vx_mem_address(dst_buffer, &kernel_arg.dst_addr));
-    kernel_arg.num_elems = num_elems;
-
-    std::vector<float> h_src(num_elems);
-    float expected_sum = 0.0f;
-    for (uint32_t i = 0; i < num_elems; ++i) {
-        h_src[i] = (float)(i + 1);
-        expected_sum += h_src[i];
+    // Fill B with random floats.
+    std::srand(50);
+    std::vector<float> h_B(K * N);
+    for (uint32_t i = 0; i < K * N; ++i) {
+        h_B[i] = static_cast<float>(rand()) / RAND_MAX;
     }
-    RT_CHECK(vx_copy_to_dev(src_buffer, h_src.data(), 0, src_size));
+
+    std::cout << "upload matrix A (hidden states)" << std::endl;
+    RT_CHECK(vx_copy_to_dev(A_buffer, h_A.data(), 0, a_size));
+
+    std::cout << "upload matrix B (weights)" << std::endl;
+    RT_CHECK(vx_copy_to_dev(B_buffer, h_B.data(), 0, b_size));
+
+    kernel_arg.grid_dim[0]  = M / TILE_SIZE;
+    kernel_arg.grid_dim[1]  = N / TILE_SIZE;
+    kernel_arg.block_dim[0] = TILE_SIZE;
+    kernel_arg.block_dim[1] = TILE_SIZE;
+    kernel_arg.M = M;
+    kernel_arg.N = N;
+    kernel_arg.K = K;
+    kernel_arg.tile_size = TILE_SIZE;
+    kernel_arg.A_addr = A_addr;
+    kernel_arg.B_addr = B_addr;
+    kernel_arg.C_addr = C_addr;
+
+    std::cout << "Upload kernel binary" << std::endl;
     RT_CHECK(vx_upload_kernel_file(device, kernel_file, &krnl_buffer));
+
+    std::cout << "upload kernel argument" << std::endl;
     RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
 
     // --- Arm the checker (trusted deployer window, before vx_start) -----------
-    printf("Arming checker: act_addr=0x%lx  hidden_size=%d  batch_size=%d\n",
-           (unsigned long)act_addr, HIDDEN_SIZE, NUM_TOKENS);
+    // The checker taps the *same* tensor the GEMM kernel reads as matrix A:
+    // hidden_base_addr == A_addr, hidden_size == K, batch_size == M.
+    printf("Arming checker: hidden_base_addr=0x%lx  hidden_size=%d  batch_size=%d\n",
+           (unsigned long)A_addr, K, M);
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
-                          (uint32_t)(act_addr & 0xFFFFFFFFu)));
+                          (uint32_t)(A_addr & 0xFFFFFFFFu)));
 #ifdef XLEN_64
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
-                          (uint32_t)(act_addr >> 32)));
+                          (uint32_t)(A_addr >> 32)));
 #endif
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE,  HIDDEN_SIZE));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,   NUM_TOKENS));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE,  K));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,   M));
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_NUM_FEATURES, NUM_FEATURES));
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, 1));
 
-    printf("Launching kernel (num_elems=%u, expected_sum=%.1f)\n",
-           num_elems, expected_sum);
+    std::cout << "start device" << std::endl;
     RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
+
+    std::cout << "wait for completion" << std::endl;
     RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
-    float h_result = 0.0f;
-    RT_CHECK(vx_copy_from_dev(&h_result, dst_buffer, 0, sizeof(float)));
+    std::vector<float> h_C(M * N);
+    std::cout << "download destination buffer" << std::endl;
+    RT_CHECK(vx_copy_from_dev(h_C.data(), C_buffer, 0, c_size));
 
-    printf("GPU sum = %.1f  expected = %.1f\n", h_result, expected_sum);
+    // verify result
+    std::cout << "verify result" << std::endl;
+    int errors = 0;
+    {
+        std::vector<float> h_A_float(M * K);
+        for (uint32_t i = 0; i < M * K; ++i) {
+            h_A_float[i] = fp16_to_float(h_A[i]);
+        }
+        std::vector<float> h_ref(M * N);
+        matmul_cpu(h_ref.data(), h_A_float.data(), h_B.data(), M, N, K);
+
+        for (uint32_t i = 0; i < h_ref.size(); ++i) {
+            if (!compare_float(h_C[i], h_ref[i], i, errors)) {
+                ++errors;
+            }
+        }
+    }
 
     cleanup();
 
-    if (fabsf(h_result - expected_sum) > 0.5f) {
-        printf("FAILED!\n");
-        return 1;
+    if (errors != 0) {
+        std::cout << "Found " << std::dec << errors << " errors!" << std::endl;
+        std::cout << "FAILED!" << std::endl;
+        return errors;
     }
-    printf("PASSED!\n");
+
+    std::cout << "PASSED!" << std::endl;
     return 0;
 }
