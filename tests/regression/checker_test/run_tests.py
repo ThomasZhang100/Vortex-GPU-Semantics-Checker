@@ -297,6 +297,27 @@ def fp16_ulp_distance(a: float, b: float) -> int:
     return abs(to_ordered(float(af)) - to_ordered(float(bf)))
 
 
+def percentile_strict(out: np.ndarray, p: float) -> np.ndarray:
+    """Per-column percentile that never lands exactly on a sample.
+
+    np.percentile's default linear interpolation returns an actual data
+    point whenever (B-1)*p/100 is an integer (e.g. B=5, p=25 -> rank 1.0).
+    A threshold equal bit-for-bit to one token's reference output makes
+    `ref > threshold` a knife-edge tie, so a few ULPs of RTL/reference FMA
+    rounding slop can flip the fired bit for that one token/feature. Nudge
+    the rank by half a slot whenever it would be exact so the result always
+    falls strictly between two order statistics instead.
+    """
+    B = out.shape[0]
+    sorted_out = np.sort(out, axis=0)
+    rank = (B - 1) * p / 100.0
+    if rank == int(rank):
+        rank = min(rank + 0.5, B - 1)
+    lo, hi = int(np.floor(rank)), int(np.ceil(rank))
+    frac = rank - lo
+    return sorted_out[lo] + frac * (sorted_out[hi] - sorted_out[lo])
+
+
 # ---------------------------------------------------------------------------
 # Test case definition
 # ---------------------------------------------------------------------------
@@ -328,7 +349,7 @@ class TestCase:
         self.weights     = rng.normal(0, 0.1, (H, F)).astype(np.float32)
         # Thresholds at 25th percentile of expected outputs → ~75% of features fire
         out = fp16_matmul(self.activations, self.weights)
-        self.thresholds  = np.percentile(out, 25, axis=0).astype(np.float32)
+        self.thresholds  = percentile_strict(out, 25).astype(np.float32)
         return self
 
     def build_negative(self, seed: int = 42) -> "TestCase":
@@ -338,7 +359,7 @@ class TestCase:
         self.activations = rng.uniform(-2, 2, (B, H)).astype(np.float32)
         self.weights     = rng.uniform(-0.5, 0.5, (H, F)).astype(np.float32)
         out = fp16_matmul(self.activations, self.weights)
-        self.thresholds  = np.percentile(out, 50, axis=0).astype(np.float32)
+        self.thresholds  = percentile_strict(out, 50).astype(np.float32)
         return self
 
 
