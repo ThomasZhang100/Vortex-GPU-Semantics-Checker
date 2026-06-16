@@ -455,7 +455,7 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
         print(f"  FAIL: {len(mismatches)} feature firing mismatch(es):")
         for b, f in mismatches[:200]:
             print(f"    tok[{b}] feat[{f}]: expected_fire={int(fired_ref[b, f])}  "
-                  f"rtl_fire={int(fired_rtl[b, f])}")
+                  f"rtl_fire={int(fired_rtl[b, f])}  threshold={float(tc.thresholds[f]):.6g}")
         if len(mismatches) > 200:
             print(f"    ... ({len(mismatches) - 200} more)")
         return False
