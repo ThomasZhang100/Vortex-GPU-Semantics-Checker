@@ -23,9 +23,16 @@
 // Enable: -DCHECKER_ENABLE
 // DCRs:   VX_DCR_CHECKER_ENABLE       (rising edge arms checker)
 //         VX_DCR_CHECKER_TAP_ADDR0/1  (hidden-state base address)
-//         VX_DCR_CHECKER_HIDDEN_SIZE  (FP16 elements per token)
+//         VX_DCR_CHECKER_HIDDEN_SIZE  (FP32 elements per token)
 //         VX_DCR_CHECKER_BATCH_SIZE   (total tokens, ≤ MAX_BATCH)
 //         VX_DCR_CHECKER_NUM_FEATURES (total SAE features, ≤ MAX_FEATURES)
+//
+// Activations arrive in their native FP32 form (the core's FPU has no FP16
+// datapath) and are narrowed to FP16 by fp32_to_fp16() right at the L2
+// response, before anything is pushed into the per-row FIFOs. The systolic
+// array and weight SRAM stay FP16 — only the ingest path widens to 4B/elem.
+// This keeps the narrowing inside checker-owned hardware: the model's kernel
+// is never trusted to downcast its own activations correctly.
 
 `include "VX_define.vh"
 
@@ -35,8 +42,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     parameter MAX_HIDDEN    = 2048,            // max hidden_size (SRAM depth)
     parameter MAX_FEATURES  = 64,             // max total SAE features; must be multiple of N_FEAT
     parameter MAX_BATCH     = 16,             // max total batch size; must be multiple of B_TILE
-    parameter FIFO_DEPTH    = 64,              // FP16 slots per activation FIFO row
-    parameter LINE_WORDS    = `L1_LINE_SIZE/2, // FP16 values per cache line (64B/2B=32)
+    parameter FIFO_DEPTH    = 64,              // FP16 slots per activation FIFO row (post-narrowing)
+    parameter LINE_WORDS    = `L1_LINE_SIZE/4, // FP32 values per cache line (64B/4B=16)
     parameter `STRING WEIGHT_FILE    = "",     // $readmemh hex (MAX_HIDDEN × MAX_FEATURES FP16)
     parameter `STRING THRESHOLD_FILE = ""      // $readmemh hex (MAX_FEATURES FP16 thresholds)
 ) (
@@ -46,7 +53,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     // DCR-supplied config (latched in VX_cluster before vx_start)
     input  wire                         checker_armed,
     input  wire [`MEM_ADDR_WIDTH-1:0]   hidden_base_addr,
-    input  wire [15:0]                  hidden_size,    // FP16 elements per token
+    input  wire [15:0]                  hidden_size,    // FP32 elements per token
     input  wire [15:0]                  num_features,   // actual number of SAE features
     input  wire [15:0]                  batch_size,     // total tokens across all batch tiles
 
@@ -148,10 +155,54 @@ module VX_checker import VX_gpu_pkg::*; #(
     end
 
     // -------------------------------------------------------------------------
+    // FP32 -> FP16 narrowing conversion (round-to-nearest-even), applied to
+    // every activation element as it comes off the L2 response, before it's
+    // pushed into a per-row FIFO. Real hidden states are produced by the
+    // core's native FP32 FPU (Vortex has no FP16 datapath); the systolic
+    // array stays FP16 for area, so this is the one place the narrowing
+    // happens — inside checker-owned hardware, never in the model's kernel.
+    // FP16-subnormal results are flushed to zero rather than rounded into
+    // the subnormal range, trading a small amount of dynamic range at the
+    // bottom of FP16 (< ~6e-5 in magnitude) for a much smaller, fixed-shift
+    // conversion unit (no variable-width barrel shifter needed).
+    // -------------------------------------------------------------------------
+    function automatic logic [15:0] fp32_to_fp16(input logic [31:0] x);
+        logic        sign   = x[31];
+        logic [7:0]  exp32  = x[30:23];
+        logic [22:0] mant32 = x[22:0];
+        int          exp16;
+        logic [10:0] mant16_rnd;
+        logic        round_up;
+
+        if (exp32 == 8'hFF) begin
+            // Inf / NaN.
+            return {sign, 5'h1F, (mant32 != 23'h0) ? 10'h200 : 10'h000};
+        end
+        if (exp32 == 8'h00) begin
+            // Zero or float32 subnormal — both far below FP16's normal range.
+            return {sign, 15'h0000};
+        end
+
+        exp16 = int'(exp32) - 127 + 15;
+
+        // Round-to-nearest-even on the 13 mantissa bits FP16 doesn't keep:
+        // guard = mant32[12], sticky = OR(mant32[11:0]), tie-break = mant32[13]
+        // (the LSB of the 10 bits being kept).
+        round_up   = mant32[12] && (mant32[11:0] != 12'h0 || mant32[13]);
+        mant16_rnd = {1'b0, mant32[22:13]} + (round_up ? 11'd1 : 11'd0);
+
+        if (mant16_rnd[10]) exp16 = exp16 + 1; // mantissa carry bumps the exponent
+
+        if (exp16 >= 31)      return {sign, 5'h1F, 10'h000};  // overflow -> Inf
+        else if (exp16 <= 0)  return {sign, 15'h0000};        // underflow -> 0
+        else                  return {sign, exp16[4:0], mant16_rnd[9:0]};
+    endfunction
+
+    // -------------------------------------------------------------------------
     // Per-row cache-line alignment skip.
     // When a token's start byte address is not cache-line aligned the L2
     // returns a cache line that begins before the token.  row_skip[b] is the
-    // number of FP16 elements at the head of the first cache-line response
+    // number of FP32 elements at the head of the first cache-line response
     // that belong to the previous token and must be discarded.
     // per_row_chunks[b] = ceil((hidden_size + row_skip[b]) / LINE_WORDS)
     // replaces the old shared total_chunks so each row issues exactly the
@@ -166,10 +217,10 @@ module VX_checker import VX_gpu_pkg::*; #(
             wire [`MEM_ADDR_WIDTH-1:0] row_start_byte =
                 hidden_base_addr
                 + (`MEM_ADDR_WIDTH'(batch_tile) * B_TILE + `MEM_ADDR_WIDTH'(b))
-                  * `MEM_ADDR_WIDTH'(hidden_size) * 2;
+                  * `MEM_ADDR_WIDTH'(hidden_size) * 4;
             /* verilator lint_on UNUSEDSIGNAL */
-            // byte offset within the cache line, then divide by 2 for FP16
-            assign row_skip[b]       = row_start_byte[LINE_BITS-1:1];
+            // byte offset within the cache line, then divide by 4 for FP32
+            assign row_skip[b]       = row_start_byte[LINE_BITS-1:2];
             assign per_row_chunks[b] = CHUNKS_W'(
                 (32'(hidden_size) + 32'(row_skip[b]) + LINE_WORDS - 1) >> LOG_LW);
         end
@@ -277,19 +328,20 @@ module VX_checker import VX_gpu_pkg::*; #(
                 if (row_push[b]) begin
                     first_chunk_done[b] <= 1'b1;
                     if (!first_chunk_done[b]) begin
-                        // First cache-line response: skip row_skip[b] leading FP16
+                        // First cache-line response: skip row_skip[b] leading FP32
                         // elements that belong to the previous token's cache line.
+                        // Each surviving element is narrowed to FP16 before storage.
                         for (int w = 0; w < LINE_WORDS; w++) begin
                             if (w >= int'(row_skip[b]))
                                 fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w - int'(row_skip[b])))]
-                                    <= act_bus_if.rsp_data.data[w*16 +: 16];
+                                    <= fp32_to_fp16(act_bus_if.rsp_data.data[w*32 +: 32]);
                         end
                         wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b]
                                      + FIFO_PTR_W'(LINE_WORDS - int'(row_skip[b])));
                     end else begin
                         for (int w = 0; w < LINE_WORDS; w++)
                             fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w))]
-                                <= act_bus_if.rsp_data.data[w*16 +: 16];
+                                <= fp32_to_fp16(act_bus_if.rsp_data.data[w*32 +: 32]);
                         wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
                     end
                 end
@@ -593,7 +645,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     wire [`MEM_ADDR_WIDTH-1:0] req_byte_addr =
           hidden_base_addr
         + ((`MEM_ADDR_WIDTH'(batch_tile) * B_TILE + `MEM_ADDR_WIDTH'(issue_row))
-           * `MEM_ADDR_WIDTH'(hidden_size) * 2)
+           * `MEM_ADDR_WIDTH'(hidden_size) * 4)
         + (`MEM_ADDR_WIDTH'(next_chunk[issue_row]) * LINE_BYTES);
 
     // -------------------------------------------------------------------------
@@ -721,8 +773,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                 `TRACE(3, ("%t: [CHECKER] req  bt=%0d ft=%0d row=%0d chunk=%0d addr=0x%0h\n",
                     $time, batch_tile, feat_tile, issue_row, next_chunk[issue_row], req_byte_addr))
             if (rsp_fire)
-                `TRACE(3, ("%t: [CHECKER] rsp  row=%0d  data[15:0]=0x%0h\n",
-                    $time, rsp_row, act_bus_if.rsp_data.data[15:0]))
+                `TRACE(3, ("%t: [CHECKER] rsp  row=%0d  data[31:0]=0x%0h\n",
+                    $time, rsp_row, act_bus_if.rsp_data.data[31:0]))
             if (k_stall)
                 `TRACE(3, ("%t: [CHECKER] stall  k_started=%0b  k_done=%0b\n",
                     $time, k_started, k_done))

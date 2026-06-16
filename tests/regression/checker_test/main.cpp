@@ -2,7 +2,6 @@
 #include <fstream>
 #include <vector>
 #include <cmath>
-#include <cstring>
 #include <unistd.h>
 #include <vortex.h>
 #include <VX_types.h>
@@ -28,50 +27,6 @@ static int TILE_SIZE    = 4;   // sgemm2-style local-memory tile size
 
 ///////////////////////////////////////////////////////////////////////////////
 
-// Minimal float<->FP16 conversion helpers (host side; exact, no rounding
-// modes needed for widening, and correct for the integer-valued ramp data).
-static uint16_t float_to_fp16(float v) {
-    uint32_t bits;
-    memcpy(&bits, &v, 4);
-    uint16_t sign  = (bits >> 31) & 1;
-    int32_t  exp32 = ((bits >> 23) & 0xFF) - 127;
-    uint32_t mant  = bits & 0x7FFFFF;
-    if (exp32 < -24) return (uint16_t)(sign << 15);
-    if (exp32 >  15) return (uint16_t)((sign << 15) | 0x7C00u);
-    uint16_t exp16  = (uint16_t)(exp32 + 15);
-    uint16_t mant16 = (uint16_t)(mant >> 13);
-    return (uint16_t)((sign << 15) | (exp16 << 10) | mant16);
-}
-
-static float fp16_to_float(uint16_t h) {
-    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-    uint32_t exp  = (h >> 10) & 0x1Fu;
-    uint32_t mant = h & 0x3FFu;
-    uint32_t bits;
-    if (exp == 0) {
-        if (mant == 0) {
-            bits = sign;
-        } else {
-            int32_t e = -1;
-            do {
-                mant <<= 1;
-                ++e;
-            } while (!(mant & 0x400u));
-            mant &= 0x3FFu;
-            bits = sign | ((uint32_t)(112 - e) << 23) | (mant << 13);
-        }
-    } else if (exp == 0x1Fu) {
-        bits = sign | 0x7F800000u | (mant << 13);
-    } else {
-        bits = sign | ((exp + 112) << 23) | (mant << 13);
-    }
-    float f;
-    memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
-///////////////////////////////////////////////////////////////////////////////
-
 static bool compare_float(float a, float b, int index, int errors) {
     union fi_t { float f; int32_t i; };
     fi_t fa, fb;
@@ -87,8 +42,9 @@ static bool compare_float(float a, float b, int index, int errors) {
     return true;
 }
 
-// Reference sgemm: C[M x N] = A[M x K] * B[K x N], with A supplied pre-widened
-// to float (it lives in device memory as FP16, same tensor the checker taps).
+// Reference sgemm: C[M x N] = A[M x K] * B[K x N]. A is native FP32, the same
+// tensor the checker taps (it narrows to FP16 itself in hardware — see
+// VX_checker.sv's fp32_to_fp16 — so this reference doesn't need to model that).
 static void matmul_cpu(float* C, const float* A, const float* B,
                         uint32_t M, uint32_t N, uint32_t K) {
     for (uint32_t m = 0; m < M; ++m) {
@@ -103,11 +59,11 @@ static void matmul_cpu(float* C, const float* A, const float* B,
 }
 
 const char* kernel_file = "kernel.vxbin";
-bool ones_activation = false;   // -o: fill A with fp16(1.0) for ground-truth check
-const char* act_file = nullptr; // -A: load FP16 A from binary file (overrides -o)
+bool ones_activation = false;   // -o: fill A with 1.0f for ground-truth check
+const char* act_file = nullptr; // -A: load FP32 A from binary file (overrides -o)
 
 vx_device_h device      = nullptr;
-vx_buffer_h A_buffer    = nullptr;   // [M x K] FP16 "hidden states" — also the checker's tap
+vx_buffer_h A_buffer    = nullptr;   // [M x K] FP32 "hidden states" — also the checker's tap
 vx_buffer_h B_buffer    = nullptr;   // [K x N] FP32 weights
 vx_buffer_h C_buffer    = nullptr;   // [M x N] FP32 output
 vx_buffer_h krnl_buffer = nullptr;
@@ -180,9 +136,12 @@ int main(int argc, char* argv[]) {
         exit(-1);
     }
 
-    // --- A buffer: [M x K] FP16 "hidden states" — both the GEMM input and the
-    // exact tensor the checker independently taps off L2 (see arming below). --
-    uint32_t a_size = M * K * sizeof(uint16_t);
+    // --- A buffer: [M x K] FP32 "hidden states" — both the GEMM input and the
+    // exact tensor the checker independently taps off L2 (see arming below).
+    // The checker narrows each element to FP16 itself, in hardware, right at
+    // the L2 response (VX_checker.sv's fp32_to_fp16) — nothing here or in
+    // kernel.cpp ever produces or consumes FP16.
+    uint32_t a_size = M * K * sizeof(float);
     RT_CHECK(vx_mem_alloc(device, a_size, VX_MEM_READ, &A_buffer));
     uint64_t A_addr = 0;
     RT_CHECK(vx_mem_address(A_buffer, &A_addr));
@@ -199,15 +158,15 @@ int main(int argc, char* argv[]) {
     uint64_t C_addr = 0;
     RT_CHECK(vx_mem_address(C_buffer, &C_addr));
 
-    std::cout << "matrix A (hidden states): " << M << "x" << K << " (FP16)" << std::endl;
+    std::cout << "matrix A (hidden states): " << M << "x" << K << " (FP32)" << std::endl;
     std::cout << "matrix B (weights):       " << K << "x" << N << " (FP32)" << std::endl;
     std::cout << "matrix C (output):        " << M << "x" << N << " (FP32)" << std::endl;
     std::cout << "tile size: " << TILE_SIZE << "x" << TILE_SIZE << "  local memory: " << local_mem << " bytes" << std::endl;
     std::cout << "A_addr=0x" << std::hex << A_addr << "  B_addr=0x" << B_addr
                << "  C_addr=0x" << C_addr << std::dec << std::endl;
 
-    // Fill A: -A file -> load FP16 binary; -o -> fp16(1.0); default -> ramp.
-    std::vector<uint16_t> h_A(M * K);
+    // Fill A: -A file -> load FP32 binary; -o -> 1.0f; default -> ramp.
+    std::vector<float> h_A(M * K);
     if (act_file) {
         std::ifstream f(act_file, std::ios::binary);
         if (!f) { fprintf(stderr, "Error: cannot open act_file '%s'\n", act_file); cleanup(); exit(-1); }
@@ -216,8 +175,7 @@ int main(int argc, char* argv[]) {
     } else {
         for (uint32_t m = 0; m < M; ++m)
             for (uint32_t k = 0; k < K; ++k) {
-                float v = ones_activation ? 1.0f : (float)(m * K + k + 1);
-                h_A[m * K + k] = float_to_fp16(v);
+                h_A[m * K + k] = ones_activation ? 1.0f : (float)(m * K + k + 1);
             }
     }
 
@@ -282,12 +240,8 @@ int main(int argc, char* argv[]) {
     std::cout << "verify result" << std::endl;
     int errors = 0;
     {
-        std::vector<float> h_A_float(M * K);
-        for (uint32_t i = 0; i < M * K; ++i) {
-            h_A_float[i] = fp16_to_float(h_A[i]);
-        }
         std::vector<float> h_ref(M * N);
-        matmul_cpu(h_ref.data(), h_A_float.data(), h_B.data(), M, N, K);
+        matmul_cpu(h_ref.data(), h_A.data(), h_B.data(), M, N, K);
 
         for (uint32_t i = 0; i < h_ref.size(); ++i) {
             if (!compare_float(h_C[i], h_ref[i], i, errors)) {

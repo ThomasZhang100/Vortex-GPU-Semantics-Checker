@@ -35,7 +35,7 @@ BUILD_DIR  = REPO_ROOT / "build"
 TEST_DIR   = Path(__file__).parent
 WEIGHT_HEX = TEST_DIR / "sae_weights_test.hex"
 THRESH_HEX = TEST_DIR / "thresholds.hex"
-ACT_BIN    = TEST_DIR / "act_test.bin"   # FP16 activation binary injected via -A
+ACT_BIN    = TEST_DIR / "act_test.bin"   # FP32 activation binary injected via -A
 BLACKBOX   = BUILD_DIR / "ci" / "blackbox.sh"
 
 # Must match the compiled RTL parameter VX_checker MAX_FEATURES.
@@ -124,8 +124,14 @@ def write_weight_hex(weights: np.ndarray, path: Path,
 
 
 def write_act_bin(activations: np.ndarray, path: Path) -> None:
-    """Write FP16 activations as a raw binary file (row-major, matched by -A in main.cpp)."""
-    activations.astype(np.float16).tofile(path)
+    """Write FP32 activations as a raw binary file (row-major, matched by -A in main.cpp).
+
+    main.cpp's -A path loads raw FP32 bytes directly into matrix A; the checker
+    narrows each element to FP16 itself in hardware (VX_checker.sv's
+    fp32_to_fp16) when it taps the tensor off L2, so the file injected here
+    must stay FP32 end to end.
+    """
+    activations.astype(np.float32).tofile(path)
 
 
 def write_threshold_hex(count_k: int, thresholds: np.ndarray, path: Path) -> None:
@@ -148,7 +154,7 @@ def run_sim(num_tokens: int, num_features: int, hidden_size: int,
     Run blackbox.sh and return (returncode, combined_stdout_stderr).
     blackbox.sh is invoked from BUILD_DIR so toolchain_env.sh is already
     sourced in the environment (caller must ensure that, or add it here).
-    act_bin: if provided, passed as -A <path> to inject arbitrary FP16 activations.
+    act_bin: if provided, passed as -A <path> to inject arbitrary FP32 activations.
     """
     app_args = f"-T {num_tokens} -F {num_features} -H {hidden_size}"
     if act_bin is not None:
