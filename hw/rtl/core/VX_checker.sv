@@ -223,7 +223,10 @@ module VX_checker import VX_gpu_pkg::*; #(
 
         if (exp32_adj >= 9'd143)      return {sign, 5'h1F, 10'h000};
         else if (exp32_adj <= 9'd112) return {sign, 15'h0000};
-        else return {sign, (exp32_adj - 9'd112)[4:0], mant16_rnd[9:0]};
+        else begin
+            automatic logic [8:0] exp16_v = exp32_adj - 9'd112;
+            return {sign, exp16_v[4:0], mant16_rnd[9:0]};
+        end
     endfunction
 
     // -------------------------------------------------------------------------
