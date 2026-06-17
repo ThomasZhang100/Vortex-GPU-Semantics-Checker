@@ -224,7 +224,10 @@ module VX_checker import VX_gpu_pkg::*; #(
         if (exp32_adj >= 9'd143)      return {sign, 5'h1F, 10'h000};
         else if (exp32_adj <= 9'd112) return {sign, 15'h0000};
         else begin
+            // exp32_adj ∈ [113,142] → result ∈ [1,30]: bits [8:5] are always 0.
+            /* verilator lint_off UNUSEDSIGNAL */
             automatic logic [8:0] exp16_v = exp32_adj - 9'd112;
+            /* verilator lint_on UNUSEDSIGNAL */
             return {sign, exp16_v[4:0], mant16_rnd[9:0]};
         end
     endfunction
@@ -661,11 +664,17 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int b = 0; b < B_TILE; b++) begin
                 // gb = batch_tile * B_TILE + b.  B_TILE=4 is a power of two,
                 // so this is a concatenation: {batch_tile, 2-bit b}.
+                // gb = batch_tile*B_TILE + b.  B_TILE=4 is a power of two so this
+                // is a concatenation.  gb ≤ MAX_BATCH-1 = 15 (4 bits); the 5-bit
+                // gb only exceeds 4 bits when batch_tile's MSB would be set, which
+                // can't happen since batch_tile ≤ MAX_BATCH_TILES-1 = 3 (2 bits).
                 automatic logic [BATCH_TILE_W+ROW_ID_BITS-1:0] gb =
                     {batch_tile, ROW_ID_BITS'(b)};
                 if (gb < (BATCH_TILE_W+ROW_ID_BITS)'(MAX_BATCH))
+                    /* verilator lint_off WIDTHTRUNC */
                     global_flag[gb] <= (gb < (BATCH_TILE_W+ROW_ID_BITS)'(batch_size)) &&
                                        (feat_count[b] > FEAT_COUNT_W'(threshold[0]));
+                    /* verilator lint_on WIDTHTRUNC */
             end
         end
     end
