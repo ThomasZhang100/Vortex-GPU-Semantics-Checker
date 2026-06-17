@@ -26,6 +26,8 @@
 //         VX_DCR_CHECKER_HIDDEN_SIZE  (FP32 elements per token)
 //         VX_DCR_CHECKER_BATCH_SIZE   (total tokens, ≤ MAX_BATCH)
 //         VX_DCR_CHECKER_NUM_FEATURES (total SAE features, ≤ MAX_FEATURES)
+//         VX_DCR_CHECKER_WEIGHT_DATA  (stream 32b words into weight SRAM; 32 writes = one row)
+//         VX_DCR_CHECKER_THRESH_DATA  (stream uint16 into threshold[]; auto-advance)
 //
 // Activations arrive in their native FP32 form (the core's FPU has no FP16
 // datapath) and are narrowed to FP16 by fp32_to_fp16() right at the L2
@@ -62,7 +64,19 @@ module VX_checker import VX_gpu_pkg::*; #(
     output wire [MAX_BATCH-1:0]         flag_o,
 
     // Dedicated L2 port for activation prefetch
-    VX_mem_bus_if.master                act_bus_if
+    VX_mem_bus_if.master                act_bus_if,
+
+    // Weight SRAM write port — driven by VX_cluster.sv's DCR streaming state.
+    // weight_we_i pulses for one cycle after the 32nd WEIGHT_DATA DCR word;
+    // weight_waddr_i and weight_wdata_i are stable at that edge.
+    input wire                                weight_we_i,
+    input wire [`CLOG2(MAX_HIDDEN)-1:0]       weight_waddr_i,
+    input wire [MAX_FEATURES*16-1:0]          weight_wdata_i,
+
+    // Threshold write port — one uint16 per THRESH_DATA DCR write.
+    input wire                                thresh_we_i,
+    input wire [`CLOG2(MAX_FEATURES+2)-1:0]   thresh_waddr_i,
+    input wire [15:0]                         thresh_wdata_i
 );
     // -------------------------------------------------------------------------
     // Localparams
@@ -387,10 +401,10 @@ module VX_checker import VX_gpu_pkg::*; #(
     ) weight_sram (
         .clk   (clk),
         .reset (reset),
-        .write (1'b0),
+        .write (weight_we_i),
         .wren  (1'b1),
-        .waddr ({WEIGHT_ADDRW{1'b0}}),
-        .wdata ({WEIGHT_DATAW{1'b0}}),
+        .waddr (weight_waddr_i),
+        .wdata (weight_wdata_i),
         .read  (1'b1),
         .raddr (k_count[0][WEIGHT_ADDRW-1:0]),
         .rdata (weight_row_out)
@@ -404,6 +418,11 @@ module VX_checker import VX_gpu_pkg::*; #(
     initial begin
         for (int n = 0; n <= MAX_FEATURES; n++) threshold[n] = '0;
         if (THRESHOLD_FILE != "") $readmemh(THRESHOLD_FILE, threshold);
+    end
+    // DCR write path: THRESH_DATA writes override the initial values at runtime.
+    always_ff @(posedge clk) begin
+        if (thresh_we_i)
+            threshold[thresh_waddr_i] <= thresh_wdata_i;
     end
 
     // Extract the current feat_tile's N_FEAT column slice from the SRAM output row.

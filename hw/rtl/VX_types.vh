@@ -34,6 +34,13 @@
 `define VX_DCR_CHECKER_HIDDEN_SIZE      12'h013  // FP16 elements per token (e.g. 1536)
 `define VX_DCR_CHECKER_BATCH_SIZE       12'h014  // number of tokens in batch (≤ MAX_BATCH)
 `define VX_DCR_CHECKER_NUM_FEATURES     12'h015  // number of SAE features (≤ MAX_FEATURES)
+`define VX_DCR_CHECKER_WEIGHT_DATA      12'h016  // stream 32b word into weight SRAM (32 writes = one MAX_FEATURES-wide row)
+`define VX_DCR_CHECKER_THRESH_DATA      12'h017  // stream uint16 (bits[15:0]) into threshold[] (auto-advance)
+
+// Checker compile-time geometry — must match VX_checker.sv parameter defaults.
+// Exposed here so the host driver (main.cpp, vx_dcr_write) can compute buffer sizes.
+`define VX_CHECKER_MAX_FEATURES         64       // SRAM columns (FP16 values per row)
+`define VX_CHECKER_MAX_HIDDEN           2048     // SRAM depth (rows)
 
 `define VX_DCR_BASE_STATE(addr)         ((addr) - `VX_DCR_BASE_STATE_BEGIN)
 `define VX_DCR_BASE_STATE_COUNT         (`VX_DCR_BASE_STATE_END-`VX_DCR_BASE_STATE_BEGIN)

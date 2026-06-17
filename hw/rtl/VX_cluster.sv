@@ -176,15 +176,48 @@ module VX_cluster import VX_gpu_pkg::*; #(
     logic [15:0]                 checker_batch_size;
     logic [15:0]                 checker_num_features;
 
+    // Weight SRAM streaming state — must match VX_checker parameter defaults.
+    localparam CHK_MAX_FEAT  = 64;
+    localparam CHK_MAX_HIDN  = 2048;
+    localparam CHK_W_DATAW   = CHK_MAX_FEAT * 16;      // 1024 bits per SRAM row
+    localparam CHK_W_ADDRW   = $clog2(CHK_MAX_HIDN);   // 11
+    localparam CHK_W_WORDS   = CHK_W_DATAW / 32;        // 32 uint32 words per row
+    localparam CHK_W_WORD_W  = $clog2(CHK_W_WORDS);     // 5
+    localparam CHK_T_CNT     = CHK_MAX_FEAT + 1;        // threshold[0..64]
+    localparam CHK_T_IDX_W   = $clog2(CHK_T_CNT + 1);  // 7
+
+    logic [CHK_W_ADDRW-1:0]  w_wrow;   // next SRAM row to write
+    logic [CHK_W_WORD_W-1:0] w_wcol;   // word position within the row (0..CHK_W_WORDS-1)
+    logic [CHK_W_DATAW-1:0]  w_wbuf;   // accumulation buffer for the current row
+    logic                     w_we;    // single-cycle pulse: write w_wbuf to w_waddr
+    logic [CHK_W_ADDRW-1:0]  w_waddr;  // SRAM row address latched when w_we fires
+    logic [CHK_T_IDX_W-1:0]  t_widx;   // next threshold index to write
+    logic                     t_we;    // single-cycle pulse: write t_wdata to t_waddr
+    logic [CHK_T_IDX_W-1:0]  t_waddr;  // threshold index latched when t_we fires
+    logic [15:0]              t_wdata;  // threshold value latched when t_we fires
+
     initial begin
         checker_armed            = 0;
         checker_hidden_base_addr = 0;
         checker_hidden_size      = 0;
         checker_batch_size       = 0;
         checker_num_features     = 0;
+        w_wrow  = '0;
+        w_wcol  = '0;
+        w_wbuf  = '0;
+        w_we    = 1'b0;
+        w_waddr = '0;
+        t_widx  = '0;
+        t_we    = 1'b0;
+        t_waddr = '0;
+        t_wdata = 16'h0;
     end
 
     always @(posedge clk) begin
+        // Default: clear write-enable pulses each cycle.
+        w_we <= 1'b0;
+        t_we <= 1'b0;
+
         if (dcr_bus_if.write_valid) begin
             case (dcr_bus_if.write_addr)
                 `VX_DCR_CHECKER_ENABLE:
@@ -201,6 +234,32 @@ module VX_cluster import VX_gpu_pkg::*; #(
                     checker_batch_size                          <= dcr_bus_if.write_data[15:0];
                 `VX_DCR_CHECKER_NUM_FEATURES:
                     checker_num_features                        <= dcr_bus_if.write_data[15:0];
+
+                // Weight SRAM streaming: accumulate 32 bits at a time into w_wbuf.
+                // After CHK_W_WORDS (32) writes, latch address and pulse w_we for one
+                // cycle so VX_checker's weight_sram sees a valid write at the next edge.
+                `VX_DCR_CHECKER_WEIGHT_DATA: begin
+                    w_wbuf[w_wcol * 32 +: 32] <= dcr_bus_if.write_data;
+                    if (w_wcol == CHK_W_WORD_W'(CHK_W_WORDS - 1)) begin
+                        w_we    <= 1'b1;
+                        w_waddr <= w_wrow;
+                        w_wrow  <= w_wrow + CHK_W_ADDRW'(1);
+                        w_wcol  <= '0;
+                    end else begin
+                        w_wcol  <= w_wcol + CHK_W_WORD_W'(1);
+                    end
+                end
+
+                // Threshold streaming: one uint16 per write, auto-advance index.
+                // Saturates at CHK_T_CNT-1 so excess writes don't wrap into threshold[0].
+                `VX_DCR_CHECKER_THRESH_DATA: begin
+                    t_we    <= 1'b1;
+                    t_waddr <= t_widx;
+                    t_wdata <= dcr_bus_if.write_data[15:0];
+                    if (t_widx != CHK_T_IDX_W'(CHK_T_CNT - 1))
+                        t_widx <= t_widx + CHK_T_IDX_W'(1);
+                end
+
                 default:;
             endcase
         end
@@ -215,10 +274,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[NUM_SOCKETS * `L1_MEM_PORTS], chk_act_bus_if);
 
     wire [15:0] checker_flag;
-    VX_checker #(
-        .WEIGHT_FILE    ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/sae_weights_test.hex"),
-        .THRESHOLD_FILE ("/scratch/Vortex-GPU-Semantics-Checker/tests/regression/checker_test/thresholds.hex")
-    ) sem_checker (
+    VX_checker sem_checker (
         .clk              (clk),
         .reset            (reset),
         .checker_armed    (checker_armed),
@@ -227,7 +283,13 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .num_features     (checker_num_features),
         .batch_size       (checker_batch_size),
         .flag_o           (checker_flag),
-        .act_bus_if       (chk_act_bus_if)
+        .act_bus_if       (chk_act_bus_if),
+        .weight_we_i      (w_we),
+        .weight_waddr_i   (w_waddr),
+        .weight_wdata_i   (w_wbuf),
+        .thresh_we_i      (t_we),
+        .thresh_waddr_i   (t_waddr),
+        .thresh_wdata_i   (t_wdata)
     );
     `UNUSED_VAR (checker_flag);
 `endif

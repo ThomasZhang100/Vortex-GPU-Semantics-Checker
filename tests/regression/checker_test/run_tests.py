@@ -33,9 +33,11 @@ import numpy as np
 REPO_ROOT  = Path(__file__).resolve().parents[3]          # vortex-research/
 BUILD_DIR  = REPO_ROOT / "build"
 TEST_DIR   = Path(__file__).parent
-WEIGHT_HEX = TEST_DIR / "sae_weights_test.hex"
-THRESH_HEX = TEST_DIR / "thresholds.hex"
-ACT_BIN    = TEST_DIR / "act_test.bin"   # FP32 activation binary injected via -A
+WEIGHT_HEX = TEST_DIR / "sae_weights_test.hex"   # kept for debugging / $readmemh reference
+THRESH_HEX = TEST_DIR / "thresholds.hex"          # kept for debugging / $readmemh reference
+ACT_BIN    = TEST_DIR / "act_test.bin"            # FP32 activation binary injected via -A
+WEIGHT_BIN = TEST_DIR / "weights_test.bin"        # FP16 weight binary loaded via DCR (-W)
+THRESH_BIN = TEST_DIR / "thresholds_test.bin"     # uint16 threshold binary loaded via DCR (-C)
 BLACKBOX   = BUILD_DIR / "ci" / "blackbox.sh"
 
 # Must match the compiled RTL parameter VX_checker MAX_FEATURES.
@@ -143,20 +145,60 @@ def write_threshold_hex(count_k: int, thresholds: np.ndarray, path: Path) -> Non
             f.write(f"{bits:04x}\n")
 
 
+def write_weight_bin(weights: np.ndarray, path: Path,
+                     max_features: int = MAX_FEATURES) -> None:
+    """Write weight SRAM binary for DCR streaming via VX_DCR_CHECKER_WEIGHT_DATA.
+
+    Format: [hidden_size × max_features] FP16, row-major, little-endian.
+    Each row is zero-padded to max_features so main.cpp always streams exactly
+    max_features/2 uint32 words per row regardless of the actual num_features.
+    Feature n occupies bytes [n*2 : n*2+2] within each row (feature 0 = LSB
+    of the first uint32 word), matching the weight_wbuf bit layout in
+    VX_cluster.sv: w_wbuf[word_idx*32 +: 32] → features [2*word_idx, 2*word_idx+1].
+    """
+    hidden, nfeat = weights.shape
+    padded = np.zeros((hidden, max_features), dtype=np.float16)
+    padded[:, :nfeat] = weights.astype(np.float16)
+    padded.tofile(path)
+
+
+def write_thresh_bin(count_k: int, thresholds: np.ndarray, path: Path) -> None:
+    """Write threshold binary for DCR streaming via VX_DCR_CHECKER_THRESH_DATA.
+
+    Format: [num_features+1] uint16, little-endian.
+      index 0 : count_k (raw uint16 — global flag fires when fired-count > count_k)
+      index 1..N : per-feature FP16 activation thresholds
+    main.cpp streams these in order; VX_cluster.sv's t_widx auto-increments.
+    """
+    arr = np.empty(len(thresholds) + 1, dtype=np.uint16)
+    arr[0] = count_k & 0xFFFF
+    for i, v in enumerate(thresholds):
+        arr[i + 1] = int(np.float16(v).view(np.uint16))
+    arr.tofile(path)
+
+
 # ---------------------------------------------------------------------------
 # Simulation runner + trace parser
 # ---------------------------------------------------------------------------
 
 def run_sim(num_tokens: int, num_features: int, hidden_size: int,
+            weight_bin: Optional[Path] = None,
+            thresh_bin: Optional[Path] = None,
             act_bin: Optional[Path] = None,
             cores: int = 2, extra_app_args: str = "") -> tuple[int, str]:
     """
     Run blackbox.sh and return (returncode, combined_stdout_stderr).
     blackbox.sh is invoked from BUILD_DIR so toolchain_env.sh is already
     sourced in the environment (caller must ensure that, or add it here).
-    act_bin: if provided, passed as -A <path> to inject arbitrary FP32 activations.
+    weight_bin: FP16 weight binary loaded via -W (VX_DCR_CHECKER_WEIGHT_DATA).
+    thresh_bin: uint16 threshold binary loaded via -C (VX_DCR_CHECKER_THRESH_DATA).
+    act_bin:    FP32 activation binary injected via -A.
     """
     app_args = f"-T {num_tokens} -F {num_features} -H {hidden_size}"
+    if weight_bin is not None:
+        app_args += f" -W {weight_bin}"
+    if thresh_bin is not None:
+        app_args += f" -C {thresh_bin}"
     if act_bin is not None:
         app_args += f" -A {act_bin}"
     if extra_app_args:
@@ -379,10 +421,14 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     print(f"  tokens={tc.num_tokens}  features={tc.num_features}  "
           f"hidden={tc.hidden_size}  k={tc.count_k}")
 
-    # Write input files — activations as binary so GPU gets exactly what Python computed
+    # Write input files: weights + thresholds as binaries for DCR loading,
+    # activations as FP32 binary so the GPU gets exactly what Python computed.
+    write_weight_bin(tc.weights, WEIGHT_BIN)
+    write_thresh_bin(tc.count_k, tc.thresholds, THRESH_BIN)
+    write_act_bin(tc.activations, ACT_BIN)
+    # Also write hex files for debugging / manual $readmemh inspection.
     write_weight_hex(tc.weights, WEIGHT_HEX)
     write_threshold_hex(tc.count_k, tc.thresholds, THRESH_HEX)
-    write_act_bin(tc.activations, ACT_BIN)
 
     # Compute reference (fp16_matmul accumulates in FP16, matching the RTL MAC chain)
     ref_matrix  = fp16_matmul(tc.activations, tc.weights)          # [B, F] fp16
@@ -390,20 +436,10 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     expected    = reference_flags(fired_ref, tc.count_k)            # [B] bool
     print(f"  expected flags: {expected.astype(int).tolist()}")
 
-    # if verbose:
-    #     np.set_printoptions(
-    #         linewidth=180,
-    #         precision=6,
-    #         suppress=False
-    #     )
-
-    #     print_fp16_hex_matrix("activations", tc.activations)
-    #     print_fp16_hex_matrix("weights.T", tc.weights.T)
-    #     print_fp16_hex_matrix("ref_matrix", ref_matrix)
-
     # Run simulation
     try:
         rc, output = run_sim(tc.num_tokens, tc.num_features, tc.hidden_size,
+                             weight_bin=WEIGHT_BIN, thresh_bin=THRESH_BIN,
                              act_bin=ACT_BIN)
     except subprocess.TimeoutExpired:
         print("  FAIL: simulation timed out")
