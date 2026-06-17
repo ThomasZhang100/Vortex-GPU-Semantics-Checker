@@ -119,6 +119,13 @@ module VX_checker import VX_gpu_pkg::*; #(
     localparam FEAT_TILE_W     = `CLOG2(MAX_FEAT_TILES  + 1);
     localparam BATCH_TILE_W    = `CLOG2(MAX_BATCH_TILES + 1);
 
+    // COL_CNT_W: per-row scan column counter.  Values 0..N_FEAT-1 are valid;
+    // N_FEAT is the sentinel meaning "this row's scan window has not started yet
+    // or has already finished."  Needs one extra bit beyond log2(N_FEAT).
+    localparam COL_CNT_W       = `CLOG2(N_FEAT + 1);  // 5 bits for N_FEAT=16
+    // GF_W: global-feature-index width.  gf = {feat_tile, col_cnt[3:0]}; max = MAX_FEATURES-1.
+    localparam GF_W            = FEAT_TILE_W + `CLOG2(N_FEAT);
+
     // -------------------------------------------------------------------------
     // Rising-edge detector for checker_armed
     // -------------------------------------------------------------------------
@@ -195,32 +202,28 @@ module VX_checker import VX_gpu_pkg::*; #(
         logic        sign   = x[31];
         logic [7:0]  exp32  = x[30:23];
         logic [22:0] mant32 = x[22:0];
-        int          exp16;
-        logic [10:0] mant16_rnd;
         logic        round_up;
+        logic [10:0] mant16_rnd;
+        logic [8:0]  exp32_adj;  // exp32 + mantissa-carry, 9 bits
 
-        if (exp32 == 8'hFF) begin
-            // Inf / NaN.
+        if (exp32 == 8'hFF)
             return {sign, 5'h1F, (mant32 != 23'h0) ? 10'h200 : 10'h000};
-        end
-        if (exp32 == 8'h00) begin
-            // Zero or float32 subnormal — both far below FP16's normal range.
+        if (exp32 == 8'h00)
             return {sign, 15'h0000};
-        end
 
-        exp16 = int'(exp32) - 127 + 15;
-
-        // Round-to-nearest-even on the 13 mantissa bits FP16 doesn't keep:
-        // guard = mant32[12], sticky = OR(mant32[11:0]), tie-break = mant32[13]
-        // (the LSB of the 10 bits being kept).
+        // Round-to-nearest-even: guard=mant32[12], sticky=|mant32[11:0], tie=mant32[13]
         round_up   = mant32[12] && (mant32[11:0] != 12'h0 || mant32[13]);
-        mant16_rnd = {1'b0, mant32[22:13]} + (round_up ? 11'd1 : 11'd0);
+        mant16_rnd = {1'b0, mant32[22:13]} + {10'b0, round_up};
 
-        if (mant16_rnd[10]) exp16 = exp16 + 1; // mantissa carry bumps the exponent
+        // Fold the mantissa carry into the exponent before range checks so there
+        // is no int intermediate.  exp16 = exp32 - 112; we compare exp32_adj instead:
+        //   exp16 >= 31  ↔  exp32_adj >= 143
+        //   exp16 <= 0   ↔  exp32_adj <= 112
+        exp32_adj = {1'b0, exp32} + {8'b0, mant16_rnd[10]};
 
-        if (exp16 >= 31)      return {sign, 5'h1F, 10'h000};  // overflow -> Inf
-        else if (exp16 <= 0)  return {sign, 15'h0000};        // underflow -> 0
-        else                  return {sign, exp16[4:0], mant16_rnd[9:0]};
+        if (exp32_adj >= 9'd143)      return {sign, 5'h1F, 10'h000};
+        else if (exp32_adj <= 9'd112) return {sign, 15'h0000};
+        else return {sign, (exp32_adj - 9'd112)[4:0], mant16_rnd[9:0]};
     endfunction
 
     // -------------------------------------------------------------------------
@@ -576,20 +579,47 @@ module VX_checker import VX_gpu_pkg::*; #(
     endfunction
 
     // -------------------------------------------------------------------------
+    // Per-row scan column counter.
+    // col_cnt[b] tracks which column of the current feat_tile row b is scanning.
+    // Row b's window opens when scan_cnt == SCAN_INIT - b; col_cnt starts at 0
+    // and increments each scan cycle, saturating at N_FEAT (done sentinel).
+    // This replaces the combinational  scan_cnt → col_i → gf  chain with a
+    // registered counter, shrinking the row_fired_now critical path.
+    // -------------------------------------------------------------------------
+    logic [COL_CNT_W-1:0] col_cnt [B_TILE];
+
+    always_ff @(posedge clk) begin
+        if (reset || pass_reset) begin
+            for (int b = 0; b < B_TILE; b++)
+                col_cnt[b] <= COL_CNT_W'(N_FEAT);  // N_FEAT sentinel: not started
+        end else if (sa_cscan_en) begin
+            for (int b = 0; b < B_TILE; b++) begin
+                if (scan_cnt == SCAN_CTR_W'(SCAN_INIT - b))
+                    col_cnt[b] <= '0;                          // open this row's window
+                else if (col_cnt[b] < COL_CNT_W'(N_FEAT))
+                    col_cnt[b] <= col_cnt[b] + COL_CNT_W'(1); // advance column
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
     // row_fired_now[b]: the actual hardware firing decision for whatever
     // feature column b is scanning out this cycle (fp16_gt against its
     // threshold).  Factored out of the feat_count update so simulation-only
     // tracing can observe the exact bit the comparator produced, rather than
     // recomputing it in software from the dumped accumulator value.
+    //
+    // gf = {feat_tile, col_cnt[b][LOG_N_FEAT-1:0]}  — a concatenation, no arithmetic.
+    // Validity: col_cnt[b] < N_FEAT  ↔  col_cnt[b][COL_CNT_W-1] == 0.
     // -------------------------------------------------------------------------
     logic [B_TILE-1:0] row_fired_now;
     always_comb begin
         for (int b = 0; b < B_TILE; b++) begin
-            automatic int col_i = int'(SCAN_INIT) - int'(scan_cnt) - b;
-            automatic int gf    = int'(feat_tile) * N_FEAT + col_i;
-            // threshold[gf+1]: feature thresholds start at index 1
-            row_fired_now[b] = (col_i >= 0) && (col_i < N_FEAT) &&
-                                (gf < int'(num_features)) &&
+            automatic logic [GF_W-1:0] gf =
+                {feat_tile[FEAT_TILE_W-1:0], col_cnt[b][`CLOG2(N_FEAT)-1:0]};
+            // col_cnt < N_FEAT means this row's scan window is open
+            row_fired_now[b] = (col_cnt[b] < COL_CNT_W'(N_FEAT)) &&
+                                (gf < GF_W'(num_features)) &&
                                 fp16_gt(sa_c_out[b], threshold[gf + 1]);
         end
     end
@@ -626,9 +656,12 @@ module VX_checker import VX_gpu_pkg::*; #(
             global_flag <= '0;
         end else if (scan_done_pulse && last_feat_tile) begin
             for (int b = 0; b < B_TILE; b++) begin
-                automatic int gb = int'(batch_tile) * B_TILE + b;
-                if (gb < MAX_BATCH)
-                    global_flag[gb] <= (gb < int'(batch_size)) &&
+                // gb = batch_tile * B_TILE + b.  B_TILE=4 is a power of two,
+                // so this is a concatenation: {batch_tile, 2-bit b}.
+                automatic logic [BATCH_TILE_W+ROW_ID_BITS-1:0] gb =
+                    {batch_tile, ROW_ID_BITS'(b)};
+                if (gb < (BATCH_TILE_W+ROW_ID_BITS)'(MAX_BATCH))
+                    global_flag[gb] <= (gb < (BATCH_TILE_W+ROW_ID_BITS)'(batch_size)) &&
                                        (feat_count[b] > FEAT_COUNT_W'(threshold[0]));
             end
         end
@@ -646,7 +679,8 @@ module VX_checker import VX_gpu_pkg::*; #(
         issue_row   = '0;
         issue_valid = 1'b0;
         for (int i = 0; i < B_TILE; i++) begin
-            automatic int bi = (int'(issue_rr) + i) % B_TILE;
+            // ROW_ID_BITS = log2(B_TILE); addition wraps mod B_TILE automatically.
+            automatic logic [ROW_ID_BITS-1:0] bi = issue_rr + ROW_ID_BITS'(i);
             if (!issue_valid
                     && !rearm
                     && (state == ACTIVE)
