@@ -102,6 +102,17 @@ static void parse_args(int argc, char** argv) {
     }
 }
 
+void cleanup() {
+    if (device) {
+        vx_mem_free(A_buffer);
+        vx_mem_free(B_buffer);
+        vx_mem_free(C_buffer);
+        vx_mem_free(krnl_buffer);
+        vx_mem_free(args_buffer);
+        vx_dev_close(device);
+    }
+}
+
 // Stream SAE weights into the checker's private SRAM via VX_DCR_CHECKER_WEIGHT_DATA.
 // File format (written by run_tests.py write_weight_bin):
 //   [HIDDEN_SIZE × VX_CHECKER_MAX_FEATURES] FP16 values, row-major, little-endian.
@@ -109,13 +120,13 @@ static void parse_args(int argc, char** argv) {
 // VX_cluster.sv assembles 32 words into a 1024-bit buffer then pulses the SRAM write.
 static void load_checker_weights(vx_device_h dev, const char* path, int hidden_size) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { fprintf(stderr, "Error: cannot open weight file '%s'\n", path); exit(-1); }
+    if (!f) { fprintf(stderr, "Error: cannot open weight file '%s'\n", path); cleanup(); exit(-1); }
     const int words_per_row = VX_CHECKER_MAX_FEATURES / 2;  // 2 FP16 per uint32
     for (int k = 0; k < hidden_size; k++) {
         for (int w = 0; w < words_per_row; w++) {
             uint32_t word = 0;
             f.read(reinterpret_cast<char*>(&word), sizeof(word));
-            if (!f) { fprintf(stderr, "Error: short read from weight file at row %d word %d\n", k, w); exit(-1); }
+            if (!f) { fprintf(stderr, "Error: short read from weight file at row %d word %d\n", k, w); cleanup(); exit(-1); }
             RT_CHECK(vx_dcr_write(dev, VX_DCR_CHECKER_WEIGHT_DATA, word));
         }
     }
@@ -127,23 +138,12 @@ static void load_checker_weights(vx_device_h dev, const char* path, int hidden_s
 //   [0] = count_k (uint16),  [1..N] = per-feature FP16 activation thresholds.
 static void load_checker_thresholds(vx_device_h dev, const char* path, int num_features) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { fprintf(stderr, "Error: cannot open threshold file '%s'\n", path); exit(-1); }
+    if (!f) { fprintf(stderr, "Error: cannot open threshold file '%s'\n", path); cleanup(); exit(-1); }
     for (int i = 0; i <= num_features; i++) {
         uint16_t val = 0;
         f.read(reinterpret_cast<char*>(&val), sizeof(val));
-        if (!f) { fprintf(stderr, "Error: short read from threshold file at index %d\n", i); exit(-1); }
+        if (!f) { fprintf(stderr, "Error: short read from threshold file at index %d\n", i); cleanup(); exit(-1); }
         RT_CHECK(vx_dcr_write(dev, VX_DCR_CHECKER_THRESH_DATA, static_cast<uint32_t>(val)));
-    }
-}
-
-void cleanup() {
-    if (device) {
-        vx_mem_free(A_buffer);
-        vx_mem_free(B_buffer);
-        vx_mem_free(C_buffer);
-        vx_mem_free(krnl_buffer);
-        vx_mem_free(args_buffer);
-        vx_dev_close(device);
     }
 }
 
