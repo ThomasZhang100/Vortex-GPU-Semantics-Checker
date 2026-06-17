@@ -238,6 +238,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     logic [B_TILE-1:0][FIFO_CTR_W-1:0]       count;
 
     logic [B_TILE-1:0][CHUNKS_W-1:0] next_chunk;
+    // Block chunk N+1 until chunk N's response arrives: DRAM misses can return
+    // out of order, which would silently scramble the FIFO and corrupt MACs.
+    logic [B_TILE-1:0] chunk_inflight;
 
     // -------------------------------------------------------------------------
     // Response routing
@@ -618,7 +621,8 @@ module VX_checker import VX_gpu_pkg::*; #(
                     && !rearm
                     && (state == ACTIVE)
                     && (count[bi] <= FIFO_CTR_W'(FIFO_HALF))
-                    && (next_chunk[bi] < per_row_chunks[bi])) begin
+                    && (next_chunk[bi] < per_row_chunks[bi])
+                    && !chunk_inflight[bi]) begin
                 issue_row   = ROW_ID_BITS'(bi);
                 issue_valid = 1'b1;
             end
@@ -629,13 +633,18 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     always_ff @(posedge clk) begin
         if (reset || pass_reset) begin
-            issue_rr <= '0;
-      
+            issue_rr      <= '0;
+            chunk_inflight <= '0;
             for (int b = 0; b < B_TILE; b++)
                 next_chunk[b] <= '0;
-        end else if (req_fire) begin
-            next_chunk[issue_row] <= next_chunk[issue_row] + CHUNKS_W'(1);
-            issue_rr              <= issue_rr + ROW_ID_BITS'(1);
+        end else begin
+            if (req_fire) begin
+                next_chunk[issue_row]     <= next_chunk[issue_row] + CHUNKS_W'(1);
+                issue_rr                  <= issue_rr + ROW_ID_BITS'(1);
+                chunk_inflight[issue_row] <= 1'b1;
+            end
+            if (rsp_fire)
+                chunk_inflight[rsp_row] <= 1'b0;
         end
     end
 
