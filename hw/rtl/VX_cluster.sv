@@ -295,9 +295,9 @@ module VX_cluster import VX_gpu_pkg::*; #(
     localparam CHK_SNOOP_N   = NUM_SOCKETS * `L1_MEM_PORTS;
     localparam CHK_ADDR_W    = `MEM_ADDR_WIDTH - CHK_LINE_BITS;
 
-    // Verilator requires constant indices on interface arrays, so use a generate
-    // loop (genvar = compile-time constant) to extract signals into plain wire
-    // arrays that the always_comb loop can index with a variable.
+    // Interface arrays must be indexed by a compile-time constant; use a generate
+    // loop (genvar) to extract signals into plain wire arrays that the always_comb
+    // loop can then index with a variable integer.
     wire                      snoop_valid [CHK_SNOOP_N];
     wire                      snoop_rw    [CHK_SNOOP_N];
     wire [CHK_ADDR_W-1:0]     snoop_laddr [CHK_SNOOP_N];
