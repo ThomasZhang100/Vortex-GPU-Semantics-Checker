@@ -292,15 +292,31 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // so reconstruct full byte addr before comparing against the DCR range.
     // -------------------------------------------------------------------------
     localparam CHK_LINE_BITS = $clog2(`L1_LINE_SIZE);  // 6 for 64-byte lines
+    localparam CHK_SNOOP_N   = NUM_SOCKETS * `L1_MEM_PORTS;
+    localparam CHK_ADDR_W    = `MEM_ADDR_WIDTH - CHK_LINE_BITS;
+
+    // Verilator requires constant indices on interface arrays, so use a generate
+    // loop (genvar = compile-time constant) to extract signals into plain wire
+    // arrays that the always_comb loop can index with a variable.
+    wire                      snoop_valid [CHK_SNOOP_N];
+    wire                      snoop_rw    [CHK_SNOOP_N];
+    wire [CHK_ADDR_W-1:0]     snoop_laddr [CHK_SNOOP_N];
+
+    generate
+        for (genvar si = 0; si < CHK_SNOOP_N; si++) begin : g_snoop_flat
+            assign snoop_valid[si] = l2_core_bus_if[si].req_valid;
+            assign snoop_rw[si]    = l2_core_bus_if[si].req_data.rw;
+            assign snoop_laddr[si] = l2_core_bus_if[si].req_data.addr;
+        end
+    endgenerate
 
     logic addr_snoop;
     always_comb begin
         addr_snoop = 1'b0;
-        for (int i = 0; i < NUM_SOCKETS * `L1_MEM_PORTS; i++) begin
+        for (int i = 0; i < CHK_SNOOP_N; i++) begin
             automatic logic [`MEM_ADDR_WIDTH-1:0] req_byte =
-                `MEM_ADDR_WIDTH'(l2_core_bus_if[i].req_data.addr) << CHK_LINE_BITS;
-            if (l2_core_bus_if[i].req_valid
-                    && !l2_core_bus_if[i].req_data.rw
+                `MEM_ADDR_WIDTH'(snoop_laddr[i]) << CHK_LINE_BITS;
+            if (snoop_valid[i] && !snoop_rw[i]
                     && (req_byte >= checker_trigger_lo)
                     && (req_byte <  checker_trigger_hi))
                 addr_snoop = 1'b1;
