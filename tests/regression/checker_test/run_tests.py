@@ -377,6 +377,10 @@ class TestCase:
     num_features: int
     hidden_size:  int
     count_k:      int
+    # enable_mode maps to main.cpp -e flag:
+    #   1 = immediate arm on ENABLE DCR write (default)
+    #   3 = address-range trigger (checker waits for first L2 read of B matrix)
+    enable_mode:  int = 1
     # Numpy arrays set up before running
     activations:  Optional[np.ndarray] = field(default=None, repr=False)
     weights:      Optional[np.ndarray] = field(default=None, repr=False)
@@ -418,8 +422,9 @@ class TestCase:
 def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     print(f"\n{'='*60}")
     print(f"TEST: {tc.name}")
+    mode_tag = " [addr-trigger]" if tc.enable_mode == 3 else ""
     print(f"  tokens={tc.num_tokens}  features={tc.num_features}  "
-          f"hidden={tc.hidden_size}  k={tc.count_k}")
+          f"hidden={tc.hidden_size}  k={tc.count_k}{mode_tag}")
 
     # Write input files: weights + thresholds as binaries for DCR loading,
     # activations as FP32 binary so the GPU gets exactly what Python computed.
@@ -436,11 +441,12 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     expected    = reference_flags(fired_ref, tc.count_k)            # [B] bool
     print(f"  expected flags: {expected.astype(int).tolist()}")
 
-    # Run simulation
+    # Run simulation — pass -e flag to select arm mode.
     try:
         rc, output = run_sim(tc.num_tokens, tc.num_features, tc.hidden_size,
                              weight_bin=WEIGHT_BIN, thresh_bin=THRESH_BIN,
-                             act_bin=ACT_BIN)
+                             act_bin=ACT_BIN,
+                             extra_app_args=f"-e {tc.enable_mode}")
     except subprocess.TimeoutExpired:
         print("  FAIL: simulation timed out")
         return False
@@ -584,6 +590,17 @@ def build_suite() -> list[TestCase]:
         TestCase("rand_6tok_24feat_40hidden_k12",
                  num_tokens=6, num_features=24, hidden_size=40, count_k=12
                  ).build_random(seed=8),
+
+        # --- address-range trigger (enable_mode=3): checker fires on first L2 read of B ---
+        # Same data as rand_8tok_32feat_64hidden_k8_seed0 so any output difference
+        # from the immediate-arm equivalent is caught by the same pass/fail gate.
+        # Validates the full paper mechanism: deployer programs [B_addr, B_addr+b_size)
+        # as the trigger range; the checker sits idle until the GEMM kernel's first
+        # B-matrix cache miss fires the one-shot snoop in VX_cluster.sv.
+        TestCase("addr_trig_8tok_32feat_64hidden_k8",
+                 num_tokens=8, num_features=32, hidden_size=64, count_k=8,
+                 enable_mode=3
+                 ).build_random(seed=5),
     ]
 
 

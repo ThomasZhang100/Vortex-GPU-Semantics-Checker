@@ -65,6 +65,9 @@ bool ones_activation     = false;   // -o: fill A with 1.0f for ground-truth che
 const char* act_file     = nullptr; // -A: load FP32 A from binary file (overrides -o)
 const char* weight_file  = nullptr; // -W: FP16 weight binary  [hidden × MAX_FEATURES], DCR-loaded
 const char* thresh_file  = nullptr; // -C: uint16 threshold binary [num_features+1],   DCR-loaded
+// -e 1 (default): immediate arm on ENABLE DCR write (legacy/test mode).
+// -e 3: address-range trigger mode — checker waits for first L2 read in B-matrix range.
+static int ENABLE_MODE   = 1;
 
 vx_device_h device      = nullptr;
 vx_buffer_h A_buffer    = nullptr;   // [M x K] FP32 "hidden states" — also the checker's tap
@@ -78,19 +81,21 @@ static void show_usage() {
     std::cout << "Vortex checker+sgemm2 test." << std::endl;
     std::cout << "Usage: [-k kernel] [-o ones_activation] [-A act_file.bin]" << std::endl;
     std::cout << "       [-W weight_file.bin] [-C thresh_file.bin]" << std::endl;
+    std::cout << "       [-e enable_mode (1=immediate, 3=addr-trigger)]" << std::endl;
     std::cout << "       [-T num_tokens] [-F num_features] [-H hidden_size]" << std::endl;
     std::cout << "       [-N out_width] [-t tile_size] [-h help]" << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "k:oA:W:C:T:F:H:N:t:h")) != -1) {
+    while ((c = getopt(argc, argv, "k:oA:W:C:e:T:F:H:N:t:h")) != -1) {
         switch (c) {
         case 'k': kernel_file   = optarg;        break;
         case 'o': ones_activation = true;        break;
         case 'A': act_file      = optarg;        break;
         case 'W': weight_file   = optarg;        break;
         case 'C': thresh_file   = optarg;        break;
+        case 'e': ENABLE_MODE   = atoi(optarg);  break;
         case 'T': NUM_TOKENS    = atoi(optarg);  break;
         case 'F': NUM_FEATURES  = atoi(optarg);  break;
         case 'H': HIDDEN_SIZE   = atoi(optarg);  break;
@@ -252,7 +257,7 @@ int main(int argc, char* argv[]) {
     RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
 
     // --- Load checker weights + thresholds via DCR (trusted deployer window) ---
-    // Must happen before ENABLE=1 so the SRAM is populated before the checker arms.
+    // Must happen before ENABLE so the SRAM is populated before the checker arms.
     // Data never touches the GPU's cache/DRAM hierarchy — it flows only through
     // the MMIO/DCR path, keeping it out of reach of the model's memory accesses.
     if (weight_file) {
@@ -267,20 +272,36 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Arm the checker (trusted deployer window, before vx_start) -----------
-    // The checker taps the *same* tensor the GEMM kernel reads as matrix A:
-    // hidden_base_addr == A_addr, hidden_size == K, batch_size == M.
-    printf("Arming checker: hidden_base_addr=0x%lx  hidden_size=%d  batch_size=%d\n",
-           (unsigned long)A_addr, K, M);
+    // Tap address = A (hidden states).  Trigger range = B (the unembedding proxy):
+    // in address-trigger mode (ENABLE_MODE=3) the checker waits for the first
+    // L2 read of any byte in [B_addr, B_addr+b_size) before starting the SAE matmul.
+    // In immediate mode (ENABLE_MODE=1) the checker starts as soon as ENABLE is written.
+    uint64_t trig_lo = B_addr;
+    uint64_t trig_hi = B_addr + b_size;
+    printf("Arming checker: tap=0x%lx  hidden=%d  batch=%d  trig=[0x%lx,0x%lx)  mode=%d\n",
+           (unsigned long)A_addr, K, M,
+           (unsigned long)trig_lo, (unsigned long)trig_hi, ENABLE_MODE);
+
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
                           (uint32_t)(A_addr & 0xFFFFFFFFu)));
 #ifdef XLEN_64
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
                           (uint32_t)(A_addr >> 32)));
 #endif
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO,
+                          (uint32_t)(trig_lo & 0xFFFFFFFFu)));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_HI,
+                          (uint32_t)(trig_hi & 0xFFFFFFFFu)));
+#ifdef XLEN_64
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO1,
+                          (uint32_t)(trig_lo >> 32)));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_HI1,
+                          (uint32_t)(trig_hi >> 32)));
+#endif
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE,  K));
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,   M));
     RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_NUM_FEATURES, NUM_FEATURES));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, 1));
+    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, ENABLE_MODE));
 
     std::cout << "start device" << std::endl;
     RT_CHECK(vx_start(device, krnl_buffer, args_buffer));

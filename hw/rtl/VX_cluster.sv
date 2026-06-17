@@ -171,10 +171,13 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // Intentionally has no synchronous reset so values survive processor::run()'s
     // reset pulse (same pattern as VX_dcr_data.sv).
     logic                        checker_armed;
+    logic                        checker_addr_trig_en;   // ENABLE DCR bit 1
     logic [`MEM_ADDR_WIDTH-1:0]  checker_hidden_base_addr;
     logic [15:0]                 checker_hidden_size;
     logic [15:0]                 checker_batch_size;
     logic [15:0]                 checker_num_features;
+    logic [`MEM_ADDR_WIDTH-1:0]  checker_trigger_lo;     // trigger range low  (inclusive)
+    logic [`MEM_ADDR_WIDTH-1:0]  checker_trigger_hi;     // trigger range high (exclusive)
 
     // Weight SRAM streaming state — must match VX_checker parameter defaults.
     localparam CHK_MAX_FEAT  = 64;
@@ -198,10 +201,13 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     initial begin
         checker_armed            = 0;
+        checker_addr_trig_en     = 0;
         checker_hidden_base_addr = 0;
         checker_hidden_size      = 0;
         checker_batch_size       = 0;
         checker_num_features     = 0;
+        checker_trigger_lo       = '0;
+        checker_trigger_hi       = '0;
         w_wrow  = '0;
         w_wcol  = '0;
         w_wbuf  = '0;
@@ -220,8 +226,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
         if (dcr_bus_if.write_valid) begin
             case (dcr_bus_if.write_addr)
-                `VX_DCR_CHECKER_ENABLE:
-                    checker_armed                               <= dcr_bus_if.write_data[0];
+                `VX_DCR_CHECKER_ENABLE: begin
+                    checker_armed        <= dcr_bus_if.write_data[0];
+                    checker_addr_trig_en <= dcr_bus_if.write_data[1];
+                end
                 `VX_DCR_CHECKER_TAP_ADDR0:
                     checker_hidden_base_addr[31:0]              <= dcr_bus_if.write_data;
             `ifdef XLEN_64
@@ -234,6 +242,16 @@ module VX_cluster import VX_gpu_pkg::*; #(
                     checker_batch_size                          <= dcr_bus_if.write_data[15:0];
                 `VX_DCR_CHECKER_NUM_FEATURES:
                     checker_num_features                        <= dcr_bus_if.write_data[15:0];
+                `VX_DCR_CHECKER_TRIG_ADDR_LO:
+                    checker_trigger_lo[31:0]                    <= dcr_bus_if.write_data;
+                `VX_DCR_CHECKER_TRIG_ADDR_HI:
+                    checker_trigger_hi[31:0]                    <= dcr_bus_if.write_data;
+            `ifdef XLEN_64
+                `VX_DCR_CHECKER_TRIG_ADDR_LO1:
+                    checker_trigger_lo[`MEM_ADDR_WIDTH-1:32]    <= (`MEM_ADDR_WIDTH-32)'(dcr_bus_if.write_data);
+                `VX_DCR_CHECKER_TRIG_ADDR_HI1:
+                    checker_trigger_hi[`MEM_ADDR_WIDTH-1:32]    <= (`MEM_ADDR_WIDTH-32)'(dcr_bus_if.write_data);
+            `endif
 
                 // Weight SRAM streaming: accumulate 32 bits at a time into w_wbuf.
                 // After CHK_W_WORDS (32) writes, latch address and pulse w_we for one
@@ -265,6 +283,46 @@ module VX_cluster import VX_gpu_pkg::*; #(
         end
     end
 
+    // -------------------------------------------------------------------------
+    // L2 read-address snoop: trigger the checker when any socket's L1 cache
+    // issues a read miss whose byte address falls in [checker_trigger_lo, checker_trigger_hi).
+    // Only the core-side ports (slots 0..NUM_SOCKETS*L1_MEM_PORTS-1) are snooped;
+    // the checker's own port (last slot) is excluded.
+    // addr field on the bus is the cache-line address (byte_addr >> LINE_BITS),
+    // so reconstruct full byte addr before comparing against the DCR range.
+    // -------------------------------------------------------------------------
+    localparam CHK_LINE_BITS = $clog2(`L1_LINE_SIZE);  // 6 for 64-byte lines
+
+    logic addr_snoop;
+    always_comb begin
+        addr_snoop = 1'b0;
+        for (int i = 0; i < NUM_SOCKETS * `L1_MEM_PORTS; i++) begin
+            automatic logic [`MEM_ADDR_WIDTH-1:0] req_byte =
+                `MEM_ADDR_WIDTH'(l2_core_bus_if[i].req_data.addr) << CHK_LINE_BITS;
+            if (l2_core_bus_if[i].req_valid
+                    && !l2_core_bus_if[i].req_data.rw
+                    && (req_byte >= checker_trigger_lo)
+                    && (req_byte <  checker_trigger_hi))
+                addr_snoop = 1'b1;
+        end
+    end
+
+    // One-shot: emit a single-cycle trigger_i pulse on the first qualifying snoop
+    // hit after arming.  triggered_r suppresses re-triggers within the same arm
+    // cycle so the checker doesn't rearm mid-run.  Cleared when checker_armed
+    // deasserts (deployer writes ENABLE=0 between runs).
+    logic triggered_r;
+    initial triggered_r = 1'b0;
+
+    wire addr_trigger = addr_snoop && checker_armed && !triggered_r;
+
+    always @(posedge clk) begin
+        if (!checker_armed)
+            triggered_r <= 1'b0;
+        else if (addr_trigger)
+            triggered_r <= 1'b1;
+    end
+
     // Checker's dedicated L2 port (wired into l2_core_bus_if at slot N)
     VX_mem_bus_if #(
         .DATA_SIZE (`L1_LINE_SIZE),
@@ -284,6 +342,8 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .batch_size       (checker_batch_size),
         .flag_o           (checker_flag),
         .act_bus_if       (chk_act_bus_if),
+        .trigger_i        (addr_trigger),
+        .addr_trig_en_i   (checker_addr_trig_en),
         .weight_we_i      (w_we),
         .weight_waddr_i   (w_waddr),
         .weight_wdata_i   (w_wbuf),

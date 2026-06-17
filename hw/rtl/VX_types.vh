@@ -36,6 +36,12 @@
 `define VX_DCR_CHECKER_NUM_FEATURES     12'h015  // number of SAE features (≤ MAX_FEATURES)
 `define VX_DCR_CHECKER_WEIGHT_DATA      12'h016  // stream 32b word into weight SRAM (32 writes = one MAX_FEATURES-wide row)
 `define VX_DCR_CHECKER_THRESH_DATA      12'h017  // stream uint16 (bits[15:0]) into threshold[] (auto-advance)
+// ENABLE bit 0: arm the checker.  bit 1: use address-range trigger instead of immediate arm.
+// Address-range trigger: checker starts SAE matmul on first L2 read in [TRIG_LO, TRIG_HI).
+`define VX_DCR_CHECKER_TRIG_ADDR_LO    12'h018  // trigger byte address range low  [31:0]  (inclusive)
+`define VX_DCR_CHECKER_TRIG_ADDR_HI    12'h019  // trigger byte address range high [31:0]  (exclusive)
+`define VX_DCR_CHECKER_TRIG_ADDR_LO1   12'h01A  // trigger range low  [63:32] (XLEN_64 only)
+`define VX_DCR_CHECKER_TRIG_ADDR_HI1   12'h01B  // trigger range high [63:32] (XLEN_64 only)
 
 // Checker compile-time geometry — must match VX_checker.sv parameter defaults.
 // Exposed here so the host driver (main.cpp, vx_dcr_write) can compute buffer sizes.

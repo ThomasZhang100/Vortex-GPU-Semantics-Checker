@@ -66,6 +66,14 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Dedicated L2 port for activation prefetch
     VX_mem_bus_if.master                act_bus_if,
 
+    // Address-range trigger from VX_cluster.sv L2 snoop.
+    // trigger_i: single-cycle pulse when a qualifying L2 read lands in [TRIG_LO, TRIG_HI).
+    // addr_trig_en_i: selects trigger mode (ENABLE DCR bit 1).
+    //   0 → immediate arm on rising edge of checker_armed (legacy / test mode)
+    //   1 → arm only on trigger_i (paper mechanism: unembedding-read-triggered)
+    input wire                                trigger_i,
+    input wire                                addr_trig_en_i,
+
     // Weight SRAM write port — driven by VX_cluster.sv's DCR streaming state.
     // weight_we_i pulses for one cycle after the 32nd WEIGHT_DATA DCR word;
     // weight_waddr_i and weight_wdata_i are stable at that edge.
@@ -119,7 +127,10 @@ module VX_checker import VX_gpu_pkg::*; #(
         if (reset) armed_r <= 0;
         else       armed_r <= checker_armed;
     end
-    wire rearm = checker_armed && !armed_r;
+    // Immediate mode (addr_trig_en_i=0): rearm on rising edge of checker_armed DCR.
+    // Address-trigger mode (addr_trig_en_i=1): rearm only when VX_cluster.sv's L2
+    // snoop detects a read in [TRIG_LO, TRIG_HI) and pulses trigger_i.
+    wire rearm = (!addr_trig_en_i && checker_armed && !armed_r) || trigger_i;
 
     // -------------------------------------------------------------------------
     // State machine: IDLE → ACTIVE (on rearm) → DONE (all passes complete)
