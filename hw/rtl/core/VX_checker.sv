@@ -161,6 +161,18 @@ module VX_checker import VX_gpu_pkg::*; #(
     wire pass_reset = rearm || next_pass;
     wire batch_reset = rearm || (next_pass && last_feat_tile);
 
+    // Combinational next value of batch_tile: used to precompute row addresses
+    // at the same posedge batch_reset fires, before the NBA commits batch_tile.
+    wire [BATCH_TILE_W-1:0] batch_tile_next =
+        rearm                         ? '0 :
+        (next_pass && last_feat_tile) ? batch_tile + BATCH_TILE_W'(1) :
+                                        batch_tile;
+
+    // One-cycle delayed batch_reset: row_start_r is committed by this edge,
+    // so req_addr_r and row_addr_ready can be safely initialized here.
+    logic batch_reset_r;
+    always_ff @(posedge clk) batch_reset_r <= batch_reset;
+
     always_ff @(posedge clk) begin
         if (reset) begin
             state       <= IDLE;
@@ -233,32 +245,51 @@ module VX_checker import VX_gpu_pkg::*; #(
     endfunction
 
     // -------------------------------------------------------------------------
-    // Per-row cache-line alignment skip.
-    // When a token's start byte address is not cache-line aligned the L2
-    // returns a cache line that begins before the token.  row_skip[b] is the
-    // number of FP32 elements at the head of the first cache-line response
-    // that belong to the previous token and must be discarded.
-    // per_row_chunks[b] = ceil((hidden_size + row_skip[b]) / LINE_WORDS)
-    // replaces the old shared total_chunks so each row issues exactly the
-    // right number of cache-line requests.
+    // Per-row address precomputation (registered at each batch_tile boundary).
+    //
+    // row_start_r[b]: registered at batch_reset using batch_tile_next so the
+    //   multiplier (batch_row_index × hidden_size × 4) runs once per batch
+    //   boundary — off the active critical path (37+ idle cycles available).
+    //
+    // row_skip / per_row_chunks: derived combinationally from row_start_r with
+    //   no multiplier: bit-extract for row_skip, one adder+shift for per_row_chunks.
+    //
+    // req_addr_r[b]: cache-line-aligned running address, initialized one cycle
+    //   after batch_reset (when row_start_r is committed), incremented by
+    //   LINE_BYTES on each issued request.  req_byte_addr = req_addr_r[issue_row]
+    //   is a pure register read — 0 FO4 on the issue address critical path.
+    //
+    // row_addr_ready: gates issue_valid until req_addr_r is initialized.
     // -------------------------------------------------------------------------
+    logic [`MEM_ADDR_WIDTH-1:0] row_start_r [B_TILE];
+
+    always_ff @(posedge clk) begin
+        if (batch_reset) begin
+            for (int b = 0; b < B_TILE; b++)
+                row_start_r[b] <= hidden_base_addr
+                    + (`MEM_ADDR_WIDTH'(batch_tile_next) * B_TILE + `MEM_ADDR_WIDTH'(b))
+                      * `MEM_ADDR_WIDTH'(hidden_size) * 4;
+        end
+    end
+
+    // Combinational: bit-extract and one small adder — no multiply.
     wire [LOG_LW-1:0]   row_skip       [B_TILE];
     wire [CHUNKS_W-1:0] per_row_chunks [B_TILE];
-
     generate
         for (genvar b = 0; b < B_TILE; b++) begin : g_row_align
-            /* verilator lint_off UNUSEDSIGNAL */
-            wire [`MEM_ADDR_WIDTH-1:0] row_start_byte =
-                hidden_base_addr
-                + (`MEM_ADDR_WIDTH'(batch_tile) * B_TILE + `MEM_ADDR_WIDTH'(b))
-                  * `MEM_ADDR_WIDTH'(hidden_size) * 4;
-            /* verilator lint_on UNUSEDSIGNAL */
-            // byte offset within the cache line, then divide by 4 for FP32
-            assign row_skip[b]       = row_start_byte[LINE_BITS-1:2];
+            assign row_skip[b]       = row_start_r[b][LINE_BITS-1:2];
             assign per_row_chunks[b] = CHUNKS_W'(
                 (32'(hidden_size) + 32'(row_skip[b]) + LINE_WORDS - 1) >> LOG_LW);
         end
     endgenerate
+
+    logic [`MEM_ADDR_WIDTH-1:0] req_addr_r [B_TILE];
+
+    logic row_addr_ready;
+    always_ff @(posedge clk) begin
+        if (reset || pass_reset) row_addr_ready <= 1'b0;
+        else if (batch_reset_r)  row_addr_ready <= 1'b1;
+    end
 
     // first_chunk_done[b]: set after the first cache-line response for row b
     // arrives in a given pass; cleared on pass_reset.
@@ -703,6 +734,7 @@ module VX_checker import VX_gpu_pkg::*; #(
             if (!issue_valid
                     && !rearm
                     && (state == ACTIVE)
+                    && row_addr_ready
                     && (count[bi] <= FIFO_CTR_W'(FIFO_HALF))
                     && (next_chunk[bi] < per_row_chunks[bi])
                     && !chunk_inflight[bi]) begin
@@ -716,15 +748,25 @@ module VX_checker import VX_gpu_pkg::*; #(
 
     always_ff @(posedge clk) begin
         if (reset || pass_reset) begin
-            issue_rr      <= '0;
+            issue_rr       <= '0;
             chunk_inflight <= '0;
             for (int b = 0; b < B_TILE; b++)
                 next_chunk[b] <= '0;
         end else begin
+            // Initialize req_addr_r one cycle after batch_reset, when row_start_r
+            // has committed its new values.  req_fire and batch_reset_r cannot
+            // overlap (row_addr_ready is 0 during batch_reset_r, so issue_valid=0).
+            if (batch_reset_r) begin
+                for (int b = 0; b < B_TILE; b++)
+                    req_addr_r[b] <= {row_start_r[b][`MEM_ADDR_WIDTH-1:LINE_BITS],
+                                      LINE_BITS'(0)};
+            end
             if (req_fire) begin
                 next_chunk[issue_row]     <= next_chunk[issue_row] + CHUNKS_W'(1);
                 issue_rr                  <= issue_rr + ROW_ID_BITS'(1);
                 chunk_inflight[issue_row] <= 1'b1;
+                req_addr_r[issue_row]     <= req_addr_r[issue_row]
+                                             + `MEM_ADDR_WIDTH'(LINE_BYTES);
             end
             if (rsp_fire)
                 chunk_inflight[rsp_row] <= 1'b0;
@@ -734,11 +776,9 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     // Request address: includes batch_tile offset for the current pass.
     // -------------------------------------------------------------------------
-    wire [`MEM_ADDR_WIDTH-1:0] req_byte_addr =
-          hidden_base_addr
-        + ((`MEM_ADDR_WIDTH'(batch_tile) * B_TILE + `MEM_ADDR_WIDTH'(issue_row))
-           * `MEM_ADDR_WIDTH'(hidden_size) * 4)
-        + (`MEM_ADDR_WIDTH'(next_chunk[issue_row]) * LINE_BYTES);
+    // req_byte_addr: pure register output — 0 FO4.  req_addr_r is cache-line
+    // aligned (lower LINE_BITS = 0) so the addr field assignment below is exact.
+    wire [`MEM_ADDR_WIDTH-1:0] req_byte_addr = req_addr_r[issue_row];
 
     // -------------------------------------------------------------------------
     // Drive act_bus_if
