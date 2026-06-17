@@ -597,13 +597,20 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_ff @(posedge clk) begin
         if (reset || pass_reset) begin
             for (int b = 0; b < B_TILE; b++)
-                col_cnt[b] <= COL_CNT_W'(N_FEAT);  // N_FEAT sentinel: not started
-        end else if (sa_cscan_en) begin
+                col_cnt[b] <= COL_CNT_W'(N_FEAT);
+        end else begin
             for (int b = 0; b < B_TILE; b++) begin
-                if (scan_cnt == SCAN_CTR_W'(SCAN_INIT - b))
-                    col_cnt[b] <= '0;                          // open this row's window
-                else if (col_cnt[b] < COL_CNT_W'(N_FEAT))
-                    col_cnt[b] <= col_cnt[b] + COL_CNT_W'(1); // advance column
+                // Trigger one cycle BEFORE the row's first valid scan output so that
+                // the NBA commits col_cnt[b]=0 in time to be read that first cycle.
+                //   b=0: cswitch_pulse fires one cycle before scan_cnt reaches SCAN_INIT.
+                //   b>0: scan_cnt == SCAN_INIT-b+1 is one cycle before SCAN_INIT-b.
+                automatic logic start_now =
+                    (b == 0) ? cswitch_pulse
+                             : (sa_cscan_en && scan_cnt == SCAN_CTR_W'(SCAN_INIT - b + 1));
+                if (start_now)
+                    col_cnt[b] <= '0;
+                else if (sa_cscan_en && col_cnt[b] < COL_CNT_W'(N_FEAT))
+                    col_cnt[b] <= col_cnt[b] + COL_CNT_W'(1);
             end
         end
     end
