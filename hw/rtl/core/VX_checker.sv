@@ -129,18 +129,27 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     // Rising-edge detector for checker_armed
     // -------------------------------------------------------------------------
-    // armed_r intentionally has no synchronous reset: checker_armed survives
-    // processor::run()'s reset pulse (same as VX_dcr_data.sv pattern), so armed_r
-    // must also survive it — otherwise reset clears armed_r while checker_armed
-    // stays 1, creating a spurious rising edge that re-arms the checker.
+    // checker_armed (the DCR) survives processor::run()'s reset pulse by design.
+    // armed_r DOES reset so it is 0 when reset de-asserts while checker_armed is
+    // already 1, producing the single legitimate rising edge after reset.
+    //
+    // rearm is gated with !reset: checker_armed goes 1 DURING the processor reset
+    // phase (DCRs are applied to the RTL during init).  Without this gate the
+    // rising-edge detector fires while the state machine is being forced to IDLE
+    // by reset — a spurious ARM trace with no useful effect.  After reset
+    // de-asserts, !reset=1, checker_armed=1, armed_r=0 → rearm fires once cleanly.
+    //
+    // trigger_i (L2 snoop) is gated with addr_trig_en_i: in immediate mode the
+    // B-matrix reads will still pulse trigger_i (triggered_r starts 0, checker_armed=1),
+    // which would spuriously rearm the checker mid-run if not blocked.
     logic armed_r;
-    initial armed_r = 0;
-    always_ff @(posedge clk) armed_r <= checker_armed;
+    always_ff @(posedge clk) begin
+        if (reset) armed_r <= 0;
+        else       armed_r <= checker_armed;
+    end
 
-    // Immediate mode (addr_trig_en_i=0): rearm on rising edge of checker_armed DCR.
-    // Address-trigger mode (addr_trig_en_i=1): rearm only when VX_cluster.sv's L2
-    // snoop detects a read in [TRIG_LO, TRIG_HI) and pulses trigger_i.
-    wire rearm = (!addr_trig_en_i && checker_armed && !armed_r) || trigger_i;
+    wire rearm = (!addr_trig_en_i && checker_armed && !armed_r && !reset)
+              || ( addr_trig_en_i && trigger_i     && !reset);
 
     // -------------------------------------------------------------------------
     // State machine: IDLE → ACTIVE (on rearm) → DONE (all passes complete)
