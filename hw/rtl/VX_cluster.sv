@@ -461,8 +461,11 @@ module VX_cluster import VX_gpu_pkg::*; #(
         if (checker_armed && chk_req_fire) begin
             automatic logic [`MEM_ADDR_WIDTH-1:0] chk_byte =
                 {chk_act_bus_if.req_data.addr, CHK_LINE_BITS'(0)};
+            automatic int n_waiting = 0;
+            for (int cj = 0; cj < CHK_SNOOP_N; cj++)
+                if (snoop_valid[cj]) n_waiting++;
             `TRACE(3, ("%t: [CHK_FIRE] checker L2 req accepted  addr=0x%0h  waiting_cores=%0d\n",
-                $time, chk_byte, $countones(snoop_valid)))
+                $time, chk_byte, n_waiting))
             for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
                 if (snoop_valid[ci]) begin
                     automatic logic [`MEM_ADDR_WIDTH-1:0] core_byte =
