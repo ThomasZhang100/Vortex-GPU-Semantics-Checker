@@ -129,11 +129,14 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     // Rising-edge detector for checker_armed
     // -------------------------------------------------------------------------
+    // armed_r intentionally has no synchronous reset: checker_armed survives
+    // processor::run()'s reset pulse (same as VX_dcr_data.sv pattern), so armed_r
+    // must also survive it — otherwise reset clears armed_r while checker_armed
+    // stays 1, creating a spurious rising edge that re-arms the checker.
     logic armed_r;
-    always_ff @(posedge clk) begin
-        if (reset) armed_r <= 0;
-        else       armed_r <= checker_armed;
-    end
+    initial armed_r = 0;
+    always_ff @(posedge clk) armed_r <= checker_armed;
+
     // Immediate mode (addr_trig_en_i=0): rearm on rising edge of checker_armed DCR.
     // Address-trigger mode (addr_trig_en_i=1): rearm only when VX_cluster.sv's L2
     // snoop detects a read in [TRIG_LO, TRIG_HI) and pulses trigger_i.
