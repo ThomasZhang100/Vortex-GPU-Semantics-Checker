@@ -256,11 +256,12 @@ int main(int argc, char* argv[]) {
     std::cout << "upload kernel argument" << std::endl;
     RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
 
-#ifdef CHECKER_ENABLE
     // --- Load checker weights + thresholds via DCR (trusted deployer window) ---
-    // Must happen before ENABLE so the SRAM is populated before the checker arms.
-    // Data never touches the GPU's cache/DRAM hierarchy — it flows only through
-    // the MMIO/DCR path, keeping it out of reach of the model's memory accesses.
+    // DCR writes are always issued regardless of whether CHECKER_ENABLE is set in
+    // the RTL build: without it the decoder silently drops writes to undefined
+    // checker addresses, so the GEMM runs unchanged.  With CHECKER_ENABLE the
+    // RTL acts on them to arm the checker.  This avoids a host/RTL CONFIGS skew
+    // that would leave the checker instantiated but never armed.
     if (weight_file) {
         printf("Loading checker weights from '%s' (%d rows × %d features)\n",
                weight_file, K, VX_CHECKER_MAX_FEATURES);
@@ -305,7 +306,6 @@ int main(int argc, char* argv[]) {
         RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_NUM_FEATURES, NUM_FEATURES));
         RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, ENABLE_MODE));
     }
-#endif // CHECKER_ENABLE
 
     std::cout << "start device" << std::endl;
     RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
