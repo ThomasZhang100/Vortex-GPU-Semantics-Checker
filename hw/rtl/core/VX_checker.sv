@@ -44,7 +44,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     parameter MAX_HIDDEN    = 2048,            // max hidden_size (SRAM depth)
     parameter MAX_FEATURES  = 64,             // max total SAE features; must be multiple of N_FEAT
     parameter MAX_BATCH     = 16,             // max total batch size; must be multiple of B_TILE
-    parameter FIFO_DEPTH    = 64,              // FP16 slots per activation FIFO row (post-narrowing)
+    parameter FIFO_DEPTH    = 32,              // FP16 slots per activation FIFO row (2 cache lines; min to avoid refill overflow with 1 chunk in flight)
     parameter LINE_WORDS    = `L1_LINE_SIZE/4, // FP32 values per cache line (64B/4B=16)
     parameter `STRING WEIGHT_FILE    = "",     // $readmemh hex (MAX_HIDDEN × MAX_FEATURES FP16)
     parameter `STRING THRESHOLD_FILE = ""      // $readmemh hex (MAX_FEATURES FP16 thresholds)
