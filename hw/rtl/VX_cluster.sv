@@ -299,12 +299,14 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // loop (genvar) to extract signals into plain wire arrays that the always_comb
     // loop can then index with a variable integer.
     wire                      snoop_valid [CHK_SNOOP_N];
+    wire                      snoop_ready [CHK_SNOOP_N]; // req_ready from L2 back to core port
     wire                      snoop_rw    [CHK_SNOOP_N];
     wire [CHK_ADDR_W-1:0]     snoop_laddr [CHK_SNOOP_N];
 
     generate
         for (genvar si = 0; si < CHK_SNOOP_N; si++) begin : g_snoop_flat
             assign snoop_valid[si] = l2_core_bus_if[si].req_valid;
+            assign snoop_ready[si] = l2_core_bus_if[si].req_ready;
             assign snoop_rw[si]    = l2_core_bus_if[si].req_data.rw;
             assign snoop_laddr[si] = l2_core_bus_if[si].req_data.addr;
         end
@@ -396,9 +398,11 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // checker's own tap range [hidden_base_addr, hidden_base_addr+batch*hidden*4).
     // Enable with TRACE_LEVEL >= 3.  Filter in output: grep "CONTENTION".
     // -------------------------------------------------------------------------
+    // CONTENTION trace A: checker has a pending request but is blocked by core traffic.
+    // Shows what the cores are reading/writing that cycle.
     always @(posedge clk) begin
         if (checker_armed && chk_act_bus_if.req_valid && any_core_req) begin
-            `TRACE(3, ("%t: [CONTENTION] checker blocked — active core L2 ports:\n", $time))
+            `TRACE(3, ("%t: [CONTENTION] checker blocked by cores:\n", $time))
             for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
                 if (snoop_valid[ci]) begin
                     automatic logic [`MEM_ADDR_WIDTH-1:0] core_byte =
@@ -412,6 +416,60 @@ module VX_cluster import VX_gpu_pkg::*; #(
                         $time, ci, core_byte,
                         snoop_rw[ci] ? "WRITE" : "READ",
                         in_tap       ? "<-- TAP RANGE (A-matrix)" : ""))
+                end
+            end
+        end
+    end
+
+    // CONTENTION trace B2: checker has a request in-flight in the L2 (sent but not
+    // yet responded to) and a core port simultaneously has req_valid=1 but
+    // req_ready=0 — the core is stalled because the L2 bank or MSHR is still
+    // occupied by the checker's request.
+    // chk_inflight tracks from chk_req_fire until the response arrives.
+    logic chk_inflight_r;
+    always_ff @(posedge clk) begin
+        if (reset)
+            chk_inflight_r <= 1'b0;
+        else if (chk_req_fire)
+            chk_inflight_r <= 1'b1;
+        else if (chk_act_bus_if.rsp_valid)
+            chk_inflight_r <= 1'b0;
+    end
+
+    always @(posedge clk) begin
+        if (checker_armed && chk_inflight_r) begin
+            for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
+                if (snoop_valid[ci] && !snoop_ready[ci]) begin
+                    automatic logic [`MEM_ADDR_WIDTH-1:0] core_byte =
+                        `MEM_ADDR_WIDTH'(snoop_laddr[ci]) << CHK_LINE_BITS;
+                    `TRACE(3, ("%t: [CHK_INFLIGHT_BLOCK] core port=%0d stalled  addr=0x%0h  %s  (checker rsp pending)\n",
+                        $time, ci, core_byte,
+                        snoop_rw[ci] ? "WRITE" : "READ"))
+                end
+            end
+        end
+    end
+
+    // CONTENTION trace B: checker's request IS going out to the L2 this cycle.
+    // Log any core ports simultaneously holding a pending request — these are the
+    // cores displaced by the checker in an equal-priority arbiter (with the current
+    // low-priority gating they should always be empty, confirming zero interference).
+    wire chk_req_fire = l2_core_bus_if[CHK_L2_PORT].req_valid
+                     && l2_core_bus_if[CHK_L2_PORT].req_ready;
+
+    always @(posedge clk) begin
+        if (checker_armed && chk_req_fire) begin
+            automatic logic [`MEM_ADDR_WIDTH-1:0] chk_byte =
+                {chk_act_bus_if.req_data.addr, CHK_LINE_BITS'(0)};
+            `TRACE(3, ("%t: [CHK_FIRE] checker L2 req accepted  addr=0x%0h  waiting_cores=%0d\n",
+                $time, chk_byte, $countones(snoop_valid)))
+            for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
+                if (snoop_valid[ci]) begin
+                    automatic logic [`MEM_ADDR_WIDTH-1:0] core_byte =
+                        `MEM_ADDR_WIDTH'(snoop_laddr[ci]) << CHK_LINE_BITS;
+                    `TRACE(3, ("%t: [CHK_FIRE]   displaced port=%0d  addr=0x%0h  %s\n",
+                        $time, ci, core_byte,
+                        snoop_rw[ci] ? "WRITE" : "READ"))
                 end
             end
         end
