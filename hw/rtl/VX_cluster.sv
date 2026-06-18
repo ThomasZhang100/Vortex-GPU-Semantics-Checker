@@ -387,6 +387,37 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .thresh_wdata_i   (t_wdata)
     );
     `UNUSED_VAR (checker_flag);
+
+`ifdef SIMULATION
+    // -------------------------------------------------------------------------
+    // Core L2 contention trace: emitted whenever the checker has a pending
+    // request that is being held back by !any_core_req.  Shows every core port
+    // active at that cycle, its address, rw flag, and whether it falls in the
+    // checker's own tap range [hidden_base_addr, hidden_base_addr+batch*hidden*4).
+    // Enable with TRACE_LEVEL >= 3.  Filter in output: grep "CONTENTION".
+    // -------------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (checker_armed && chk_act_bus_if.req_valid && any_core_req) begin
+            `TRACE(3, ("%t: [CONTENTION] checker blocked — active core L2 ports:\n", $time))
+            for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
+                if (snoop_valid[ci]) begin
+                    automatic logic [`MEM_ADDR_WIDTH-1:0] core_byte =
+                        `MEM_ADDR_WIDTH'(snoop_laddr[ci]) << CHK_LINE_BITS;
+                    automatic logic in_tap =
+                        (core_byte >= checker_hidden_base_addr) &&
+                        (core_byte <  checker_hidden_base_addr
+                                      + `MEM_ADDR_WIDTH'(checker_batch_size)
+                                        * `MEM_ADDR_WIDTH'(checker_hidden_size) * 4);
+                    `TRACE(3, ("%t: [CONTENTION]   port=%0d  addr=0x%0h  %s  %s\n",
+                        $time, ci, core_byte,
+                        snoop_rw[ci] ? "WRITE" : "READ",
+                        in_tap       ? "<-- TAP RANGE (A-matrix)" : ""))
+                end
+            end
+        end
+    end
 `endif
+
+`endif  // CHECKER_ENABLE
 
 endmodule
