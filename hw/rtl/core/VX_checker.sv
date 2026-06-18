@@ -283,7 +283,8 @@ module VX_checker import VX_gpu_pkg::*; #(
         end
     endgenerate
 
-    logic [`MEM_ADDR_WIDTH-1:0] req_addr_r [B_TILE];
+    logic [`MEM_ADDR_WIDTH-1:0] req_addr_r       [B_TILE];
+    logic [CHUNKS_W-1:0]        per_row_chunks_r [B_TILE]; // registered at batch_reset_r
 
     logic row_addr_ready;
     always_ff @(posedge clk) begin
@@ -719,26 +720,46 @@ module VX_checker import VX_gpu_pkg::*; #(
     assign flag_o = global_flag;
 
     // -------------------------------------------------------------------------
-    // Issue FSM: round-robin across rows, issue when FIFO half-empty
+    // Issue FSM: round-robin across rows, issue when FIFO has room and chunks remain.
+    //
+    // Split into two stages to shrink the critical path:
+    //
+    //   Stage 1 — can_issue[b]: evaluate all B_TILE eligibility conditions IN
+    //     PARALLEL.  Each bit is independent; no chain through prior iterations.
+    //     All inputs (count, next_chunk, per_row_chunks_r, chunk_inflight) are
+    //     registered, so this is a single level of comparators.
+    //
+    //   Stage 2 — priority encode: scan can_issue[] starting from issue_rr to
+    //     find the round-robin winner.  The chain now runs over B_TILE single-bit
+    //     flags (~1 FO4 per step) rather than over full conditions (~12 FO4/step).
+    //
+    // per_row_chunks_r is registered at batch_reset_r alongside req_addr_r, so it
+    // is a stable register output with 0 FO4 into the comparison.
     // -------------------------------------------------------------------------
     logic [ROW_ID_BITS-1:0] issue_rr;
     logic [ROW_ID_BITS-1:0] issue_row;
     logic                   issue_valid;
 
+    // Stage 1: parallel eligibility — one bit per row, all computed simultaneously.
+    logic [B_TILE-1:0] can_issue;
+    always_comb begin
+        for (int b = 0; b < B_TILE; b++)
+            can_issue[b] = !rearm
+                        && (state == ACTIVE)
+                        && row_addr_ready
+                        && (count[b] <= FIFO_CTR_W'(FIFO_HALF))
+                        && (next_chunk[b] < per_row_chunks_r[b])
+                        && !chunk_inflight[b];
+    end
+
+    // Stage 2: priority encode over single-bit can_issue flags, wrapped round-robin.
     always_comb begin
         issue_row   = '0;
         issue_valid = 1'b0;
         for (int i = 0; i < B_TILE; i++) begin
-            // ROW_ID_BITS = log2(B_TILE); addition wraps mod B_TILE automatically.
             automatic logic [ROW_ID_BITS-1:0] bi = issue_rr + ROW_ID_BITS'(i);
-            if (!issue_valid
-                    && !rearm
-                    && (state == ACTIVE)
-                    && row_addr_ready
-                    && (count[bi] <= FIFO_CTR_W'(FIFO_HALF))
-                    && (next_chunk[bi] < per_row_chunks[bi])
-                    && !chunk_inflight[bi]) begin
-                issue_row   = ROW_ID_BITS'(bi);
+            if (!issue_valid && can_issue[bi]) begin
+                issue_row   = bi;
                 issue_valid = 1'b1;
             end
         end
@@ -753,13 +774,16 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int b = 0; b < B_TILE; b++)
                 next_chunk[b] <= '0;
         end else begin
-            // Initialize req_addr_r one cycle after batch_reset, when row_start_r
-            // has committed its new values.  req_fire and batch_reset_r cannot
-            // overlap (row_addr_ready is 0 during batch_reset_r, so issue_valid=0).
+            // Initialize req_addr_r and per_row_chunks_r one cycle after batch_reset,
+            // when row_start_r is committed.  req_fire cannot overlap with
+            // batch_reset_r since row_addr_ready is 0 at that point.
             if (batch_reset_r) begin
-                for (int b = 0; b < B_TILE; b++)
+                for (int b = 0; b < B_TILE; b++) begin
                     req_addr_r[b] <= {row_start_r[b][`MEM_ADDR_WIDTH-1:LINE_BITS],
                                       LINE_BITS'(0)};
+                    per_row_chunks_r[b] <= CHUNKS_W'(
+                        (32'(hidden_size) + 32'(row_skip[b]) + LINE_WORDS - 1) >> LOG_LW);
+                end
             end
             if (req_fire) begin
                 next_chunk[issue_row]     <= next_chunk[issue_row] + CHUNKS_W'(1);
