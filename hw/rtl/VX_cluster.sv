@@ -345,7 +345,26 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .TAG_WIDTH (L1_MEM_ARB_TAG_WIDTH)
     ) chk_act_bus_if();
 
-    `ASSIGN_VX_MEM_BUS_IF (l2_core_bus_if[NUM_SOCKETS * `L1_MEM_PORTS], chk_act_bus_if);
+    // Lower-priority L2 access: checker only issues a request when no core port
+    // has a pending request.  snoop_valid[] already captures every core port's
+    // req_valid, so reuse it here.  This gives cores 100% of L2 bandwidth under
+    // load and lets the checker consume only idle cycles — overhead → near zero.
+    logic any_core_req;
+    always_comb begin
+        any_core_req = 1'b0;
+        for (int i = 0; i < CHK_SNOOP_N; i++)
+            any_core_req = any_core_req | snoop_valid[i];
+    end
+
+    // Expand ASSIGN_VX_MEM_BUS_IF with req_valid gated on !any_core_req.
+    // Responses (rsp) are never gated — in-flight responses always complete.
+    localparam CHK_L2_PORT = NUM_SOCKETS * `L1_MEM_PORTS;
+    assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_act_bus_if.req_valid && !any_core_req;
+    assign l2_core_bus_if[CHK_L2_PORT].req_data  = chk_act_bus_if.req_data;
+    assign chk_act_bus_if.req_ready = l2_core_bus_if[CHK_L2_PORT].req_ready && !any_core_req;
+    assign chk_act_bus_if.rsp_valid = l2_core_bus_if[CHK_L2_PORT].rsp_valid;
+    assign chk_act_bus_if.rsp_data  = l2_core_bus_if[CHK_L2_PORT].rsp_data;
+    assign l2_core_bus_if[CHK_L2_PORT].rsp_ready = chk_act_bus_if.rsp_ready;
 
     wire [15:0] checker_flag;
     VX_checker sem_checker (
