@@ -168,10 +168,12 @@ module VX_checker import VX_gpu_pkg::*; #(
         (next_pass && last_feat_tile) ? batch_tile + BATCH_TILE_W'(1) :
                                         batch_tile;
 
-    // One-cycle delayed batch_reset: row_start_r is committed by this edge,
-    // so req_addr_r and row_addr_ready can be safely initialized here.
-    logic batch_reset_r;
-    always_ff @(posedge clk) batch_reset_r <= batch_reset;
+    // One-cycle delayed pass_reset: used to initialize req_addr_r and
+    // row_addr_ready after every pass boundary (both feat_tile and batch_tile
+    // transitions).  For batch transitions, row_start_r is committed by this
+    // edge; for feat_tile transitions, row_start_r is unchanged and correct.
+    logic pass_reset_r;
+    always_ff @(posedge clk) pass_reset_r <= pass_reset;
 
     always_ff @(posedge clk) begin
         if (reset) begin
@@ -284,12 +286,12 @@ module VX_checker import VX_gpu_pkg::*; #(
     endgenerate
 
     logic [`MEM_ADDR_WIDTH-1:0] req_addr_r       [B_TILE];
-    logic [CHUNKS_W-1:0]        per_row_chunks_r [B_TILE]; // registered at batch_reset_r
+    logic [CHUNKS_W-1:0]        per_row_chunks_r [B_TILE]; // registered at pass_reset_r
 
     logic row_addr_ready;
     always_ff @(posedge clk) begin
         if (reset || pass_reset) row_addr_ready <= 1'b0;
-        else if (batch_reset_r)  row_addr_ready <= 1'b1;
+        else if (pass_reset_r)   row_addr_ready <= 1'b1;
     end
 
     // first_chunk_done[b]: set after the first cache-line response for row b
@@ -733,7 +735,7 @@ module VX_checker import VX_gpu_pkg::*; #(
     //     find the round-robin winner.  The chain now runs over B_TILE single-bit
     //     flags (~1 FO4 per step) rather than over full conditions (~12 FO4/step).
     //
-    // per_row_chunks_r is registered at batch_reset_r alongside req_addr_r, so it
+    // per_row_chunks_r is registered at pass_reset_r alongside req_addr_r, so it
     // is a stable register output with 0 FO4 into the comparison.
     // -------------------------------------------------------------------------
     logic [ROW_ID_BITS-1:0] issue_rr;
@@ -774,10 +776,13 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int b = 0; b < B_TILE; b++)
                 next_chunk[b] <= '0;
         end else begin
-            // Initialize req_addr_r and per_row_chunks_r one cycle after batch_reset,
-            // when row_start_r is committed.  req_fire cannot overlap with
-            // batch_reset_r since row_addr_ready is 0 at that point.
-            if (batch_reset_r) begin
+            // Reinitialize req_addr_r and per_row_chunks_r one cycle after every
+            // pass_reset (both feat_tile and batch_tile transitions).  For batch
+            // transitions, row_start_r is committed by this edge.  For feat_tile
+            // transitions, row_start_r is unchanged — reinitializing req_addr_r
+            // from it resets the chunk pointer back to the row start for the new
+            // feat_tile pass.  req_fire cannot overlap since row_addr_ready is 0.
+            if (pass_reset_r) begin
                 for (int b = 0; b < B_TILE; b++) begin
                     req_addr_r[b] <= {row_start_r[b][`MEM_ADDR_WIDTH-1:LINE_BITS],
                                       LINE_BITS'(0)};
