@@ -256,6 +256,7 @@ int main(int argc, char* argv[]) {
     std::cout << "upload kernel argument" << std::endl;
     RT_CHECK(vx_upload_bytes(device, &kernel_arg, sizeof(kernel_arg_t), &args_buffer));
 
+#ifdef CHECKER_ENABLE
     // --- Load checker weights + thresholds via DCR (trusted deployer window) ---
     // Must happen before ENABLE so the SRAM is populated before the checker arms.
     // Data never touches the GPU's cache/DRAM hierarchy — it flows only through
@@ -276,32 +277,35 @@ int main(int argc, char* argv[]) {
     // in address-trigger mode (ENABLE_MODE=3) the checker waits for the first
     // L2 read of any byte in [B_addr, B_addr+b_size) before starting the SAE matmul.
     // In immediate mode (ENABLE_MODE=1) the checker starts as soon as ENABLE is written.
-    uint64_t trig_lo = B_addr;
-    uint64_t trig_hi = B_addr + b_size;
-    printf("Arming checker: tap=0x%lx  hidden=%d  batch=%d  trig=[0x%lx,0x%lx)  mode=%d\n",
-           (unsigned long)A_addr, K, M,
-           (unsigned long)trig_lo, (unsigned long)trig_hi, ENABLE_MODE);
+    {
+        uint64_t trig_lo = B_addr;
+        uint64_t trig_hi = B_addr + b_size;
+        printf("Arming checker: tap=0x%lx  hidden=%d  batch=%d  trig=[0x%lx,0x%lx)  mode=%d\n",
+               (unsigned long)A_addr, K, M,
+               (unsigned long)trig_lo, (unsigned long)trig_hi, ENABLE_MODE);
 
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
-                          (uint32_t)(A_addr & 0xFFFFFFFFu)));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
+                              (uint32_t)(A_addr & 0xFFFFFFFFu)));
 #ifdef XLEN_64
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
-                          (uint32_t)(A_addr >> 32)));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
+                              (uint32_t)(A_addr >> 32)));
 #endif
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO,
-                          (uint32_t)(trig_lo & 0xFFFFFFFFu)));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_HI,
-                          (uint32_t)(trig_hi & 0xFFFFFFFFu)));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO,
+                              (uint32_t)(trig_lo & 0xFFFFFFFFu)));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_HI,
+                              (uint32_t)(trig_hi & 0xFFFFFFFFu)));
 #ifdef XLEN_64
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO1,
-                          (uint32_t)(trig_lo >> 32)));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_HI1,
-                          (uint32_t)(trig_hi >> 32)));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO1,
+                              (uint32_t)(trig_lo >> 32)));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_HI1,
+                              (uint32_t)(trig_hi >> 32)));
 #endif
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE,  K));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,   M));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_NUM_FEATURES, NUM_FEATURES));
-    RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, ENABLE_MODE));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_HIDDEN_SIZE,  K));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_BATCH_SIZE,   M));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_NUM_FEATURES, NUM_FEATURES));
+        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, ENABLE_MODE));
+    }
+#endif // CHECKER_ENABLE
 
     std::cout << "start device" << std::endl;
     RT_CHECK(vx_start(device, krnl_buffer, args_buffer));

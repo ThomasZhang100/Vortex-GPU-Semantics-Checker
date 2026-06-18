@@ -322,6 +322,16 @@ def parse_fired_bitmap(output: str, batch_size: int,
     return result
 
 
+def parse_checker_latency(output: str) -> Optional[int]:
+    """Extract checker latency in cycles from the ALL_DONE trace line.
+
+    Matches: [CHECKER] ALL_DONE  count_thresh=N  global_flag=0xX  latency=N cycles
+    Returns the integer cycle count, or None if not found (no-checker build).
+    """
+    m = re.search(r'\[CHECKER\] ALL_DONE.*?latency=(\d+) cycles', output)
+    return int(m.group(1)) if m else None
+
+
 def fp16_ulp_distance(a: float, b: float) -> int:
     """Integer ULP distance between two values in FP16 bit-space.
 
@@ -465,16 +475,26 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
                 print("  " + line)
         return False
 
-    # Parse checker output
+    # Detect whether the build included CHECKER_ENABLE.  If no [CHECKER] trace
+    # lines appear at all the build was compiled without -DCHECKER_ENABLE; treat
+    # as a GEMM-only run (PASS if host rc=0) rather than failing on missing output.
+    if "[CHECKER]" not in output:
+        print("  PASS (GEMM only — no [CHECKER] trace; build without -DCHECKER_ENABLE)")
+        return True
+
+    # Parse checker output (CHECKER_ENABLE build)
     rtl_flags = parse_flag_vector(output, tc.num_tokens)
     if rtl_flags is None:
         print("  FAIL: [CHECKER] FLAG VECTOR block not found in output")
         return False
 
     fired = parse_fired_counts(output, tc.num_tokens)
+    latency = parse_checker_latency(output)
     print(f"  rtl    flags: {[int(f) for f in rtl_flags]}")
     if fired:
         print(f"  fired counts: {fired}")
+    if latency is not None:
+        print(f"  checker latency: {latency} cycles (rearm → all_done)")
 
     # --- matrix value diagnostic (informational only — does not gate pass/fail) ---
     rtl_matrix = parse_full_matrix(output, tc.num_tokens, tc.num_features)

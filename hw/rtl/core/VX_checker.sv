@@ -842,6 +842,14 @@ module VX_checker import VX_gpu_pkg::*; #(
     always_ff @(posedge clk)
         all_done_r <= scan_done_pulse && last_feat_tile && last_batch_tile;
 
+    // Checker latency counter: counts cycles from rearm (exclusive) to all_done_r
+    // (inclusive).  Resets on every rearm so back-to-back runs each get their own count.
+    logic [31:0] checker_cycle_cnt;
+    always_ff @(posedge clk) begin
+        if (reset || rearm) checker_cycle_cnt <= '0;
+        else                checker_cycle_cnt <= checker_cycle_cnt + 32'(1);
+    end
+
     // Capture the full B_TILE×N_FEAT matmul output during the scan phase.
     // col_i for row b at scan_cnt = SCAN_INIT - scan_cnt - b (same as row_flag indexing).
     logic [B_TILE-1:0][N_FEAT-1:0][15:0] scan_capture;
@@ -972,8 +980,8 @@ module VX_checker import VX_gpu_pkg::*; #(
             // Dump on all_done_r (1 cycle after ALL_DONE) so full_matrix_capture,
             // full_feat_count, and global_flag have their final committed values.
             if (all_done_r) begin
-                `TRACE(3, ("%t: [CHECKER] ALL_DONE  count_thresh=%0d  global_flag=0x%0x\n",
-                           $time, threshold[0], global_flag))
+                `TRACE(3, ("%t: [CHECKER] ALL_DONE  count_thresh=%0d  global_flag=0x%0x  latency=%0d cycles\n",
+                           $time, threshold[0], global_flag, checker_cycle_cnt))
                 `TRACE(3, ("%t: [CHECKER] === FLAG VECTOR (batch=%0d, features=%0d, k=%0d) ===\n",
                            $time, batch_size, num_features, threshold[0]))
                 for (int gb = 0; gb < int'(batch_size); gb++)
