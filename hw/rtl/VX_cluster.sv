@@ -369,6 +369,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     assign l2_core_bus_if[CHK_L2_PORT].rsp_ready = chk_act_bus_if.rsp_ready;
 
     wire [15:0] checker_flag;
+    wire        chk_all_done;
     VX_checker sem_checker (
         .clk              (clk),
         .reset            (reset),
@@ -378,6 +379,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .num_features     (checker_num_features),
         .batch_size       (checker_batch_size),
         .flag_o           (checker_flag),
+        .all_done_o       (chk_all_done),
         .act_bus_if       (chk_act_bus_if),
         .trigger_i        (addr_trigger),
         .addr_trig_en_i   (checker_addr_trig_en),
@@ -475,6 +477,59 @@ module VX_cluster import VX_gpu_pkg::*; #(
                         snoop_rw[ci] ? "WRITE" : "READ"))
                 end
             end
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Checker-window stall summary:
+    //   chk_window_active: high from first chk_req_fire (after arm) to all_done
+    //   chk_window_stall_cnt: cycles where ANY core port had req_valid=1 but
+    //     req_ready=0 at the L2 cluster input (backpressure) during checker window
+    //   chk_window_core_cycles: cycles where ANY core port had req_valid=1
+    //   chk_window_chk_fires: number of checker L2 requests accepted
+    //
+    // Printed when the checker finishes.  If stall_cnt == 0, L2-cluster
+    // backpressure is NOT the overhead source — look deeper (xbar, response path).
+    // Filter: grep "CHK_WINDOW_SUMMARY"
+    // -------------------------------------------------------------------------
+    logic chk_window_active;
+    logic [31:0] chk_window_stall_cnt;
+    logic [31:0] chk_window_core_cycles;
+    logic [31:0] chk_window_chk_fires;
+
+    // Combinational reduction: any core L2 cluster-input stall / any core request.
+    logic win_any_stall, win_any_req;
+    always_comb begin
+        win_any_stall = 1'b0;
+        win_any_req   = 1'b0;
+        for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
+            if (snoop_valid[ci] && !snoop_ready[ci]) win_any_stall = 1'b1;
+            if (snoop_valid[ci])                     win_any_req   = 1'b1;
+        end
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            chk_window_active      <= 1'b0;
+            chk_window_stall_cnt   <= '0;
+            chk_window_core_cycles <= '0;
+            chk_window_chk_fires   <= '0;
+        end else begin
+            if (chk_req_fire && !chk_window_active) chk_window_active <= 1'b1;
+            if (chk_all_done)                       chk_window_active <= 1'b0;
+            if (chk_window_active) begin
+                if (win_any_stall) chk_window_stall_cnt   <= chk_window_stall_cnt   + 32'd1;
+                if (win_any_req)   chk_window_core_cycles <= chk_window_core_cycles + 32'd1;
+                if (chk_req_fire)  chk_window_chk_fires   <= chk_window_chk_fires   + 32'd1;
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (chk_all_done) begin
+            `TRACE(3, ("%t: [CHK_WINDOW_SUMMARY] cluster_input_stalls=%0d  core_req_cycles=%0d  chk_fires=%0d\n",
+                       $time, chk_window_stall_cnt, chk_window_core_cycles, chk_window_chk_fires))
+            `TRACE(3, ("%t: [CHK_WINDOW_SUMMARY]   stalls>0 → L2-cluster backpressure; 0 → interference is deeper (xbar/response path)\n", $time))
         end
     end
 `endif

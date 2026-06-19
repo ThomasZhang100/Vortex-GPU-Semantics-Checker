@@ -667,4 +667,24 @@ module VX_cache import VX_gpu_pkg::*; #(
     assign cache_perf.crsp_stalls  = perf_crsp_stalls;
 `endif
 
+`ifdef SIMULATION
+    // -------------------------------------------------------------------------
+    // Bank-arbiter (xbar) stall trace.
+    // Fires when a port has a valid request but the bank arbiter can't accept it
+    // (output buffer full or bank busy).  Port numbering matches the cluster:
+    //   ports 0..NUM_SOCKETS*L1_MEM_PORTS-1 = core sockets
+    //   port  NUM_SOCKETS*L1_MEM_PORTS      = checker (L2 only, with CHECKER_ENABLE)
+    // Filter: grep "<instance>:XBAR_STALL" where instance = "l2cache" for L2.
+    // -------------------------------------------------------------------------
+    always @(posedge clk) begin
+        for (int pi = 0; pi < NUM_REQS; pi++) begin
+            if (core_req_valid[pi] && !core_req_ready[pi]) begin
+                `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
+                    $time, INSTANCE_ID, pi, core_req_bid[pi],
+                    {core_req_line_addr[pi], core_req_bid[pi], WORD_SEL_BITS'(0)}))
+            end
+        end
+    end
+`endif
+
 endmodule

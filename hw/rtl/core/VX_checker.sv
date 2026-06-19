@@ -63,6 +63,10 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Rows at or beyond batch_size are always 0.
     output wire [MAX_BATCH-1:0]         flag_o,
 
+    // Pulses high for one cycle the cycle after the final pass completes.
+    // Exposed so VX_cluster.sv can close its checker-window measurement.
+    output logic                        all_done_o,
+
     // Dedicated L2 port for activation prefetch
     VX_mem_bus_if.master                act_bus_if,
 
@@ -838,21 +842,21 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     // Simulation traces
     // -------------------------------------------------------------------------
+    // all_done_r: 1-cycle pulse the cycle after the final pass completes.
+    // Defined outside `ifdef SIMULATION so it can drive the all_done_o output port.
+    // Delay by 1 cycle so SIMULATION dump logic reads committed NBA values.
+    logic all_done_r;
+    always_ff @(posedge clk)
+        all_done_r <= scan_done_pulse && last_feat_tile && last_batch_tile;
+
+    assign all_done_o = all_done_r;
+
 `ifdef SIMULATION
     logic [B_TILE-1:0] k_done_r;
     always_ff @(posedge clk) begin
         if (reset || pass_reset) k_done_r <= '0;
         else                     k_done_r <= k_done;
     end
-
-    // Delay ALL_DONE by 1 cycle so the full-matrix dump reads committed values.
-    // full_matrix_capture[last_bt][last_ft] and global_flag[last_bt_rows] are both
-    // written (NBA) at the posedge scan_done_pulse fires for the last pass; reading
-    // them at that same posedge sees pre-update values.  all_done_r fires one cycle
-    // later when all writes are committed.
-    logic all_done_r;
-    always_ff @(posedge clk)
-        all_done_r <= scan_done_pulse && last_feat_tile && last_batch_tile;
 
     // Checker latency counter: counts cycles from rearm (exclusive) to all_done_r
     // (inclusive).  Resets on every rearm so back-to-back runs each get their own count.
