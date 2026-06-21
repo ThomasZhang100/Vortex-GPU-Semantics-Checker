@@ -685,6 +685,38 @@ module VX_cache import VX_gpu_pkg::*; #(
             end
         end
     end
+
+    // -------------------------------------------------------------------------
+    // Buffer-queuing latency trace (BUF_QUEUE).
+    // Tracks per-bank which port the bank processed last cycle vs this cycle.
+    // Two consecutive bank fires (prev→cur) means the elastic output buffer had
+    // ≥2 entries: the second port's request waited at least 1 cycle in the buffer
+    // behind the first, even though both were accepted at the xbar without stall.
+    // This is the hidden latency invisible to XBAR_STALL.
+    //
+    // When the checker port (highest port index) is prev and a core port is cur,
+    // the core experienced a 1-cycle penalty from the checker's buffer occupancy.
+    // Filter: grep "<instance>:BUF_QUEUE" — useful only for l2cache.
+    // -------------------------------------------------------------------------
+    logic [NUM_BANKS-1:0]                    prev_bank_fire;
+    logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
+
+    always_ff @(posedge clk) begin
+        for (int b = 0; b < NUM_BANKS; b++) begin
+            prev_bank_fire[b] <= per_bank_core_req_valid[b] && per_bank_core_req_ready[b];
+            if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b])
+                prev_bank_idx[b] <= per_bank_core_req_idx[b];
+        end
+    end
+
+    always @(posedge clk) begin
+        for (int b = 0; b < NUM_BANKS; b++) begin
+            if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b] && prev_bank_fire[b]) begin
+                `TRACE(3, ("%t: [%s:BUF_QUEUE] bank=%0d  prev_port=%0d → cur_port=%0d  (1-cycle buffer lag)\n",
+                    $time, INSTANCE_ID, b, prev_bank_idx[b], per_bank_core_req_idx[b]))
+            end
+        end
+    end
 `endif
 
 endmodule

@@ -847,7 +847,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     // Delay by 1 cycle so SIMULATION dump logic reads committed NBA values.
     logic all_done_r;
     always_ff @(posedge clk)
-        all_done_r <= scan_done_pulse && last_feat_tile && last_batch_tile;
+        if (reset) all_done_r <= 1'b0;
+        else       all_done_r <= scan_done_pulse && last_feat_tile && last_batch_tile;
 
     assign all_done_o = all_done_r;
 
