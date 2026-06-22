@@ -694,7 +694,15 @@
 
 // Number of Banks
 `ifndef L2_NUM_BANKS
-`define L2_NUM_BANKS `MIN(L2_NUM_REQS, 16)
+// Bank count must be power of 2 (VX_cache STATIC_ASSERT).
+// L2_NUM_REQS includes the checker port (+1) when CHECKER_ENABLE is set, but bank
+// geometry is address-interleaving — the checker is a sideband consumer, not a
+// bandwidth client, so subtract it back out before taking MIN.
+`ifdef CHECKER_ENABLE
+`define L2_NUM_BANKS `MIN(`L2_NUM_REQS - 1, 16)
+`else
+`define L2_NUM_BANKS `MIN(`L2_NUM_REQS, 16)
+`endif
 `endif
 
 // Core Response Queue Size
