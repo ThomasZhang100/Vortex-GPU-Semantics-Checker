@@ -680,8 +680,7 @@ module VX_cache import VX_gpu_pkg::*; #(
         for (int pi = 0; pi < NUM_REQS; pi++) begin
             if (core_req_valid[pi] && !core_req_ready[pi]) begin
                 `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
-                    $time, INSTANCE_ID, pi, core_req_bid[pi],
-                    {core_req_line_addr[pi], core_req_bid[pi], WORD_SEL_BITS'(0)}))
+                    $time, INSTANCE_ID, pi, core_req_bid[pi], core_req_addr[pi]))
             end
         end
     end
