@@ -139,16 +139,11 @@
 `endif
 
 `ifndef L2_LINE_SIZE
-`define L2_LINE_SIZE 128  // L2 lines are 2x L1 lines (128B vs 64B), matching NVIDIA L2 geometry.
-                          // L2_WORD_SIZE = L1_LINE_SIZE = 64B, so WORDS_PER_LINE = 2, WORD_SEL_BITS = 1.
-                          // Having L2_LINE_SIZE == L2_WORD_SIZE (WORDS_PER_LINE=1, WORD_SEL_BITS=0)
-                          // triggers a Verilator 5.x DFG peephole OOPS via zero-width signals.
+`define L2_LINE_SIZE `MEM_BLOCK_SIZE
 `endif
 
 `ifndef L3_LINE_SIZE
-`define L3_LINE_SIZE 256  // Must be >= L3_WORD_SIZE = L2_LINE_SIZE = 128B to keep WORDS_PER_LINE >= 1.
-                          // L3 is always in passthrough mode (L3_ENABLED=0) but VX_cache_wrap still
-                          // compiles its bypass path (NC_ENABLE=1) which requires valid cache geometry.
+`define L3_LINE_SIZE `MEM_BLOCK_SIZE
 `endif
 
 // Platform memory parameters
