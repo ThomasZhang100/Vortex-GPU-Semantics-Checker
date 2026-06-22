@@ -677,16 +677,6 @@ module VX_cache import VX_gpu_pkg::*; #(
         end
     end
 
-    always @(posedge clk) begin
-        for (int b = 0; b < NUM_BANKS; b++) begin
-            if (per_bank_core_req_valid[b]) begin
-                `TRACE(3, ("%t: [%s:BANK_ACTIVE] bank=%0d  port=%0d  bank_ready=%0b\n",
-                    $time, INSTANCE_ID, b,
-                    per_bank_core_req_idx[b], per_bank_core_req_ready[b]))
-            end
-        end
-    end
-
     logic [NUM_BANKS-1:0]                    prev_bank_fire;
     logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
 

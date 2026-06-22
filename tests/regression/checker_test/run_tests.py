@@ -219,7 +219,7 @@ def run_sim(num_tokens: int, num_features: int, hidden_size: int,
         env=env,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=1800,  # 30 min: covers Verilator recompile (~5-10 min) + simulation
     )
     combined = result.stdout + result.stderr
     return result.returncode, combined
