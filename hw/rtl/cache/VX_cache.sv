@@ -667,7 +667,6 @@ module VX_cache import VX_gpu_pkg::*; #(
     assign cache_perf.crsp_stalls  = perf_crsp_stalls;
 `endif
 
-/* Cache traces (XBAR_STALL, BANK_ACTIVE, BUF_QUEUE) commented out.
 `ifdef SIMULATION
     always @(posedge clk) begin
         for (int pi = 0; pi < NUM_REQS; pi++) begin
@@ -708,6 +707,5 @@ module VX_cache import VX_gpu_pkg::*; #(
         end
     end
 `endif
-*/
 
 endmodule
