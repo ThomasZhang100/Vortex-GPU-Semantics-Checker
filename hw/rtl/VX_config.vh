@@ -111,9 +111,10 @@
 `endif
 
 // NVIDIA-like hierarchy: Socket = SM (Streaming Multiprocessor)
-// Each socket has SOCKET_SIZE cores sharing L1 D$ and L2
+// SOCKET_SIZE=1: each core is its own SM with a private L1 D$/I$; all share L2.
+// This matches NVIDIA: each SM has its own L1, all SMs share L2.
 `ifndef SOCKET_SIZE
-`define SOCKET_SIZE `NUM_CORES  // All cores in one socket (like 1 SM)
+`define SOCKET_SIZE 1
 `endif
 
 `ifdef L1_DISABLE
