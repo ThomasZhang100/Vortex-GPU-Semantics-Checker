@@ -13,7 +13,10 @@
 
 `include "VX_platform.vh"
 
-`TRACING_OFF
+// TRACING_OFF intentionally omitted: Verilator 5.028 DFG peephole uses
+// tracing_off as permission to constant-fold grant_index when the checker
+// port is always gated (NUM_REQS=5 case).  Leaving this module traceable
+// prevents that fold without requiring --trace or VCD output.
 module VX_rr_arbiter #(
     parameter NUM_REQS = 1,
     parameter MODEL    = 1,
@@ -29,13 +32,6 @@ module VX_rr_arbiter #(
     output wire                     grant_valid,
     input  wire                     grant_ready
 );
-    // Hi. Verilator 5.028 DFG peephole bug workaround: with NUM_REQS=5 (4 sockets
-    // + checker L2 port), the optimizer constant-folds grant_index bit 2 to 0
-    // by observing the checker port is always gated.  This breaks L2 response
-    // routing (all responses go to port 0).  no_inline_module makes grant_index
-    // opaque to cross-module DFG analysis so the fold cannot happen.
-    /* verilator no_inline_module */
-
     `STATIC_ASSERT ((STICKY == 0) || (MODEL == 1 && LUT_OPT == 0), ("Sticky is only supported in model 1"))
 
     if (NUM_REQS == 1)  begin : g_passthru
