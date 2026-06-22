@@ -29,7 +29,7 @@ module VX_rr_arbiter #(
     output wire                     grant_valid,
     input  wire                     grant_ready
 );
-    // Verilator 5.028 DFG peephole bug workaround: with NUM_REQS=5 (4 sockets
+    // Hi. Verilator 5.028 DFG peephole bug workaround: with NUM_REQS=5 (4 sockets
     // + checker L2 port), the optimizer constant-folds grant_index bit 2 to 0
     // by observing the checker port is always gated.  This breaks L2 response
     // routing (all responses go to port 0).  no_inline_module makes grant_index
