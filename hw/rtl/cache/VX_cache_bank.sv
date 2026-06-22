@@ -13,6 +13,7 @@
 
 `include "VX_cache_define.vh"
 
+/* verilator no_inline_module */  // Prevents Verilator 5.028 DFG peephole OOPS on mem_req_valid
 module VX_cache_bank import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID= "",
     parameter BANK_ID           = 0,
