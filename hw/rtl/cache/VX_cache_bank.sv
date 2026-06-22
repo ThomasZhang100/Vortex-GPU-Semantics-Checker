@@ -13,7 +13,6 @@
 
 `include "VX_cache_define.vh"
 
-/* verilator no_inline_module */  // Prevents Verilator 5.028 DFG peephole OOPS on mem_req_valid
 module VX_cache_bank import VX_gpu_pkg::*; #(
     parameter `STRING INSTANCE_ID= "",
     parameter BANK_ID           = 0,
@@ -114,6 +113,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     input wire [`UP(UUID_WIDTH)-1:0]    flush_uuid,
     output wire                         flush_end
 );
+    /* verilator no_inline_module */
 
     localparam PIPELINE_STAGES = 2;
 
