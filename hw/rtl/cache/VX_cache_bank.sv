@@ -673,7 +673,12 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         `UNUSED_PIN (size)
     );
 
-    assign mem_req_valid = ~mreq_queue_empty;
+    // Intermediate logic breaks Verilator 5.028 DFG peephole OOPS.
+    // The optimizer crashes when propagating ~mreq_queue_empty through the
+    // mem_req_valid port into the parent's packed-array bit-select context.
+    logic mem_req_valid_w;
+    always_comb mem_req_valid_w = ~mreq_queue_empty;
+    assign mem_req_valid = mem_req_valid_w;
 
     `UNUSED_VAR (do_lookup_st0)
 
