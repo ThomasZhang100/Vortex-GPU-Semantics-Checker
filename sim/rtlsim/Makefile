@@ -94,6 +94,10 @@ VL_FLAGS += $(RTL_INCLUDE)
 VL_FLAGS += $(RTL_PKGS)
 VL_FLAGS += --cc $(TOP) --top-module $(TOP)
 
+ifneq ($(findstring VCD_OUTPUT,$(CONFIGS)),)
+VL_FLAGS += --trace
+endif
+
 # Extract RTL directories from include directories
 RTL_DIRS := $(patsubst -I%,%,$(filter -I%,$(RTL_INCLUDE)))
 
