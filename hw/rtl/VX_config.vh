@@ -139,7 +139,10 @@
 `endif
 
 `ifndef L2_LINE_SIZE
-`define L2_LINE_SIZE `MEM_BLOCK_SIZE
+`define L2_LINE_SIZE 128  // L2 lines are 2x L1 lines (128B vs 64B), matching NVIDIA L2 geometry.
+                          // L2_WORD_SIZE = L1_LINE_SIZE = 64B, so WORDS_PER_LINE = 2, WORD_SEL_BITS = 1.
+                          // Having L2_LINE_SIZE == L2_WORD_SIZE (WORDS_PER_LINE=1, WORD_SEL_BITS=0)
+                          // triggers a Verilator 5.x DFG peephole OOPS via zero-width signals.
 `endif
 
 `ifndef L3_LINE_SIZE

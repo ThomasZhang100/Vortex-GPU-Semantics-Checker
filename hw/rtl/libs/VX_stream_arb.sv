@@ -130,7 +130,11 @@ module VX_stream_arb #(
                 wire [NUM_OUTPUTS-1:0] requests;
                 for (genvar o = 0; o < NUM_OUTPUTS; ++o) begin : g_o
                     localparam i = r * NUM_OUTPUTS + o;
+                    // i may exceed NUM_INPUTS-1 when NUM_INPUTS is not a multiple of NUM_OUTPUTS.
+                    // Verilog returns 'x for out-of-range selects; suppress the Verilator warning.
+                    /* verilator lint_off SELRANGE */
                     assign requests[o] = valid_in[i];
+                    /* verilator lint_on SELRANGE */
                 end
                 assign arb_requests[r] = (| requests);
             end
