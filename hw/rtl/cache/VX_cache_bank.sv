@@ -113,8 +113,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     input wire [`UP(UUID_WIDTH)-1:0]    flush_uuid,
     output wire                         flush_end
 );
-    /* verilator no_inline_module */
-
     localparam PIPELINE_STAGES = 2;
 
 `IGNORE_UNUSED_BEGIN
@@ -673,12 +671,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         `UNUSED_PIN (size)
     );
 
-    // Intermediate logic breaks Verilator 5.028 DFG peephole OOPS.
-    // The optimizer crashes when propagating ~mreq_queue_empty through the
-    // mem_req_valid port into the parent's packed-array bit-select context.
-    logic mem_req_valid_w;
-    always_comb mem_req_valid_w = ~mreq_queue_empty;
-    assign mem_req_valid = mem_req_valid_w;
+    assign mem_req_valid = ~mreq_queue_empty;
 
     `UNUSED_VAR (do_lookup_st0)
 
