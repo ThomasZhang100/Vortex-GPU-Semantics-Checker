@@ -14,6 +14,12 @@
 `include "VX_platform.vh"
 
 `TRACING_OFF
+// Verilator 5.028 DFG peephole bug: with NUM_REQS=5 (4 sockets + checker L2
+// port), the optimizer constant-folds grant_index bit 2 to 0 by observing
+// that the checker port is always gated and can never win.  This silently
+// breaks L2→L1 response routing (all responses go to port 0).  Marking this
+// module no_inline makes the grant_index opaque to cross-module DFG analysis.
+/* verilator no_inline_module */
 module VX_rr_arbiter #(
     parameter NUM_REQS = 1,
     parameter MODEL    = 1,
