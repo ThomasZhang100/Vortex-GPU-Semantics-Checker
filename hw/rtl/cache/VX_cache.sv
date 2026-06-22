@@ -682,19 +682,6 @@ module VX_cache import VX_gpu_pkg::*; #(
         end
     end
 
-    // BUF_QUEUE state registers — trace call removed (consecutive checker
-    // requests to the same bank flood the pipe).  The always_ff block keeps
-    // per_bank_core_req_* signals live through genuine register reads.
-    logic [NUM_BANKS-1:0]                    prev_bank_fire;
-    logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
-
-    always_ff @(posedge clk) begin
-        for (int b = 0; b < NUM_BANKS; b++) begin
-            prev_bank_fire[b] <= per_bank_core_req_valid[b] && per_bank_core_req_ready[b];
-            if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b])
-                prev_bank_idx[b] <= per_bank_core_req_idx[b];
-        end
-    end
 `endif
 
 endmodule
