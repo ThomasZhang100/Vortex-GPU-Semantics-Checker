@@ -668,15 +668,11 @@ module VX_cache import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef SIMULATION
-    always @(posedge clk) begin
-        for (int pi = 0; pi < NUM_REQS; pi++) begin
-            if (core_req_valid[pi] && !core_req_ready[pi]) begin
-                `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
-                    $time, INSTANCE_ID, pi, core_req_bid[pi], core_req_addr[pi]))
-            end
-        end
-    end
-
+    // Keep these registers live so Verilator doesn't optimize away the
+    // per_bank_core_req signals they read.  Trace calls removed because the
+    // checker can fire 100+ consecutive L2 requests to the same bank, flooding
+    // the output pipe and blocking simulation.  Re-enable `TRACE lines only
+    // for short targeted debugging runs.
     logic [NUM_BANKS-1:0]                    prev_bank_fire;
     logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
 
@@ -688,14 +684,10 @@ module VX_cache import VX_gpu_pkg::*; #(
         end
     end
 
-    always @(posedge clk) begin
-        for (int b = 0; b < NUM_BANKS; b++) begin
-            if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b] && prev_bank_fire[b]) begin
-                `TRACE(3, ("%t: [%s:BUF_QUEUE] bank=%0d  prev_port=%0d → cur_port=%0d  (1-cycle buffer lag)\n",
-                    $time, INSTANCE_ID, b, prev_bank_idx[b], per_bank_core_req_idx[b]))
-            end
-        end
-    end
+    // Suppress XBAR_STALL and BUF_QUEUE trace output — re-enable below for
+    // targeted runs only.
+    `UNUSED_VAR (prev_bank_fire)
+    `UNUSED_VAR (prev_bank_idx)
 `endif
 
 endmodule
