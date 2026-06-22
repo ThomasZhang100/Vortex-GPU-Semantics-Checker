@@ -679,8 +679,8 @@ module VX_cache import VX_gpu_pkg::*; #(
     always @(posedge clk) begin
         for (int pi = 0; pi < NUM_REQS; pi++) begin
             if (core_req_valid[pi] && !core_req_ready[pi]) begin
-    //           `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
-    //                $time, INSTANCE_ID, pi, core_req_bid[pi], core_req_addr[pi]))
+                `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
+                    $time, INSTANCE_ID, pi, core_req_bid[pi], core_req_addr[pi]))
             end
         end
     end
@@ -696,8 +696,8 @@ module VX_cache import VX_gpu_pkg::*; #(
     always @(posedge clk) begin
         for (int b = 0; b < NUM_BANKS; b++) begin
             if (per_bank_core_req_valid[b]) begin
-    //            `TRACE(3, ("%t: [%s:BANK_ACTIVE] bank=%0d  port=%0d  bank_ready=%0b\n",
-    //                $time, INSTANCE_ID, b,
+                `TRACE(3, ("%t: [%s:BANK_ACTIVE] bank=%0d  port=%0d  bank_ready=%0b\n",
+                    $time, INSTANCE_ID, b,
                     per_bank_core_req_idx[b], per_bank_core_req_ready[b]))
             end
         end
@@ -729,8 +729,8 @@ module VX_cache import VX_gpu_pkg::*; #(
     always @(posedge clk) begin
         for (int b = 0; b < NUM_BANKS; b++) begin
             if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b] && prev_bank_fire[b]) begin
-    //            `TRACE(3, ("%t: [%s:BUF_QUEUE] bank=%0d  prev_port=%0d → cur_port=%0d  (1-cycle buffer lag)\n",
-    //                $time, INSTANCE_ID, b, prev_bank_idx[b], per_bank_core_req_idx[b]))
+                `TRACE(3, ("%t: [%s:BUF_QUEUE] bank=%0d  prev_port=%0d → cur_port=%0d  (1-cycle buffer lag)\n",
+                    $time, INSTANCE_ID, b, prev_bank_idx[b], per_bank_core_req_idx[b]))
             end
         end
     end
