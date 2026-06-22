@@ -687,6 +687,24 @@ module VX_cache import VX_gpu_pkg::*; #(
     end
 
     // -------------------------------------------------------------------------
+    // Bank-input active trace (BANK_ACTIVE).
+    // Fires every cycle where the elastic buffer has a valid entry at the bank.
+    // bank_ready=1 → bank accepted it; bank_ready=0 → bank busy (fill/replay/etc).
+    // Use to verify the L2 is receiving any traffic at all:
+    //   grep "l2cache.*BANK_ACTIVE" | wc -l   → total bank-active cycles
+    //   grep "l2cache.*BANK_ACTIVE" | head -5  → spot check
+    // -------------------------------------------------------------------------
+    always @(posedge clk) begin
+        for (int b = 0; b < NUM_BANKS; b++) begin
+            if (per_bank_core_req_valid[b]) begin
+                `TRACE(3, ("%t: [%s:BANK_ACTIVE] bank=%0d  port=%0d  bank_ready=%0b\n",
+                    $time, INSTANCE_ID, b,
+                    per_bank_core_req_idx[b], per_bank_core_req_ready[b]))
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
     // Buffer-queuing latency trace (BUF_QUEUE).
     // Tracks per-bank which port the bank processed last cycle vs this cycle.
     // Two consecutive bank fires (prev→cur) means the elastic output buffer had
