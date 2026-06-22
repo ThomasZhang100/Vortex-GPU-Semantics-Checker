@@ -668,11 +668,23 @@ module VX_cache import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef SIMULATION
-    // Keep these registers live so Verilator doesn't optimize away the
-    // per_bank_core_req signals they read.  Trace calls removed because the
-    // checker can fire 100+ consecutive L2 requests to the same bank, flooding
-    // the output pipe and blocking simulation.  Re-enable `TRACE lines only
-    // for short targeted debugging runs.
+    // XBAR_STALL: fires only when a port has a valid request the bank can't
+    // accept.  This is rare so it does not flood the output pipe.
+    // It also keeps core_req_ready[pi] live in Verilator's DFG — removing this
+    // trace (or using UNUSED_VAR) lets Verilator optimize away the signal, which
+    // silently breaks bank backpressure and causes a permanent MSHR deadlock.
+    always @(posedge clk) begin
+        for (int pi = 0; pi < NUM_REQS; pi++) begin
+            if (core_req_valid[pi] && !core_req_ready[pi]) begin
+                `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
+                    $time, INSTANCE_ID, pi, core_req_bid[pi], core_req_addr[pi]))
+            end
+        end
+    end
+
+    // BUF_QUEUE state registers — trace call removed (consecutive checker
+    // requests to the same bank flood the pipe).  The always_ff block keeps
+    // per_bank_core_req_* signals live through genuine register reads.
     logic [NUM_BANKS-1:0]                    prev_bank_fire;
     logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
 
@@ -683,11 +695,6 @@ module VX_cache import VX_gpu_pkg::*; #(
                 prev_bank_idx[b] <= per_bank_core_req_idx[b];
         end
     end
-
-    // Suppress XBAR_STALL and BUF_QUEUE trace output — re-enable below for
-    // targeted runs only.
-    `UNUSED_VAR (prev_bank_fire)
-    `UNUSED_VAR (prev_bank_idx)
 `endif
 
 endmodule
