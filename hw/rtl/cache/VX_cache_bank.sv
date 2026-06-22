@@ -113,12 +113,6 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     input wire [`UP(UUID_WIDTH)-1:0]    flush_uuid,
     output wire                         flush_end
 );
-    // Verilator 5.028 DFG peephole bug: with NUM_REQS=5 (4 sockets + checker),
-    // the optimizer constant-folds per_bank_core_req_idx (the xbar sel_out) to 0,
-    // breaking L2→L1 response routing.  no_inline_module prevents cross-module
-    // DFG analysis so the signal is treated as opaque at the module boundary.
-    // This is safe now that L2_NUM_BANKS is power-of-2 (the original OOPS trigger).
-    /* verilator no_inline_module */
 
     localparam PIPELINE_STAGES = 2;
 

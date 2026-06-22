@@ -679,16 +679,24 @@ module VX_cache import VX_gpu_pkg::*; #(
         end
     end
 
-    // BANK_STALL: fires when the bank has a request from the xbar but cannot
-    // accept it (fill/replay/MSHR pressure — rare).  Reads per_bank_core_req_*
-    // directly, keeping the xbar output signals live in Verilator's DFG.
-    // Without this block Verilator eliminates per_bank_core_req_idx[b], which
-    // breaks response port routing and causes a permanent MSHR deadlock.
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic [NUM_BANKS-1:0]                    prev_bank_fire;
+    logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
+
+    always_ff @(posedge clk) begin
+        for (int b = 0; b < NUM_BANKS; b++) begin
+            prev_bank_fire[b] <= per_bank_core_req_valid[b] && per_bank_core_req_ready[b];
+            if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b])
+                prev_bank_idx[b] <= per_bank_core_req_idx[b];
+        end
+    end
+    /* verilator lint_on UNUSEDSIGNAL */
+
     always @(posedge clk) begin
         for (int b = 0; b < NUM_BANKS; b++) begin
-            if (per_bank_core_req_valid[b] && !per_bank_core_req_ready[b]) begin
-                `TRACE(3, ("%t: [%s:BANK_STALL] bank=%0d  port=%0d\n",
-                    $time, INSTANCE_ID, b, per_bank_core_req_idx[b]))
+            if (per_bank_core_req_valid[b] && per_bank_core_req_ready[b] && prev_bank_fire[b]) begin
+                `TRACE(3, ("%t: [%s:BUF_QUEUE] bank=%0d  prev_port=%0d → cur_port=%0d  (1-cycle buffer lag)\n",
+                    $time, INSTANCE_ID, b, prev_bank_idx[b], per_bank_core_req_idx[b]))
             end
         end
     end
