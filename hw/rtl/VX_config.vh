@@ -676,6 +676,11 @@
 
 // L2cache Configurable Knobs /////////////////////////////////////////////////
 
+// Enable L2 cache (required for the 2-level NVIDIA-like hierarchy in this fork)
+`ifndef L2_ENABLE
+`define L2_ENABLE
+`endif
+
 // Cache Size
 `ifndef L2_CACHE_SIZE
 `define L2_CACHE_SIZE 1048576
