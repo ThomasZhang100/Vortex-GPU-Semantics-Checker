@@ -668,16 +668,27 @@ module VX_cache import VX_gpu_pkg::*; #(
 `endif
 
 `ifdef SIMULATION
-    // XBAR_STALL: fires only when a port has a valid request the bank can't
-    // accept.  This is rare so it does not flood the output pipe.
-    // It also keeps core_req_ready[pi] live in Verilator's DFG — removing this
-    // trace (or using UNUSED_VAR) lets Verilator optimize away the signal, which
-    // silently breaks bank backpressure and causes a permanent MSHR deadlock.
+    // XBAR_STALL: fires when a port has a valid request but the xbar won't accept
+    // it (bank arbitration denied this cycle).  Keeps core_req_ready[pi] live.
     always @(posedge clk) begin
         for (int pi = 0; pi < NUM_REQS; pi++) begin
             if (core_req_valid[pi] && !core_req_ready[pi]) begin
                 `TRACE(3, ("%t: [%s:XBAR_STALL] port=%0d  bank=%0d  addr=0x%0h\n",
                     $time, INSTANCE_ID, pi, core_req_bid[pi], core_req_addr[pi]))
+            end
+        end
+    end
+
+    // BANK_STALL: fires when the bank has a request from the xbar but cannot
+    // accept it (fill/replay/MSHR pressure — rare).  Reads per_bank_core_req_*
+    // directly, keeping the xbar output signals live in Verilator's DFG.
+    // Without this block Verilator eliminates per_bank_core_req_idx[b], which
+    // breaks response port routing and causes a permanent MSHR deadlock.
+    always @(posedge clk) begin
+        for (int b = 0; b < NUM_BANKS; b++) begin
+            if (per_bank_core_req_valid[b] && !per_bank_core_req_ready[b]) begin
+                `TRACE(3, ("%t: [%s:BANK_STALL] bank=%0d  port=%0d\n",
+                    $time, INSTANCE_ID, b, per_bank_core_req_idx[b]))
             end
         end
     end

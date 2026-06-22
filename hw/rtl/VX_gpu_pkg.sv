@@ -106,7 +106,7 @@ package VX_gpu_pkg;
     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
     localparam VX_DCR_DATA_WIDTH = 32;
 
-    localparam STALL_TIMEOUT = (100000 * (10 ** (`L2_ENABLED + `L3_ENABLED)));
+    localparam STALL_TIMEOUT = (100000 * (1 ** (`L2_ENABLED + `L3_ENABLED)));
 
     ///////////////////////////////////////////////////////////////////////////
 
