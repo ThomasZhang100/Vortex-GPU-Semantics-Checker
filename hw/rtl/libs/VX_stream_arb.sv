@@ -163,8 +163,10 @@ module VX_stream_arb #(
                 for (genvar r = 0; r < NUM_REQS; ++r) begin : g_r
                     localparam i = r * NUM_OUTPUTS + o;
                     if (r < NUM_INPUTS) begin : g_valid
+                        /* verilator lint_off SELRANGE */
                         assign valid_in_w[r] = valid_in[i];
                         assign data_in_w[r]  = data_in[i];
+                        /* verilator lint_on SELRANGE */
                     end else begin : g_padding
                         assign valid_in_w[r] = 0;
                         assign data_in_w[r]  = '0;

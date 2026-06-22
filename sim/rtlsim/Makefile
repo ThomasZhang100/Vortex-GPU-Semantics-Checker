@@ -85,6 +85,7 @@ TOP = rtlsim_shim
 VL_FLAGS = --exe
 VL_FLAGS += --language 1800-2009 --assert -Wall -Wpedantic
 VL_FLAGS += -Wno-DECLFILENAME -Wno-REDEFMACRO
+VL_FLAGS += --no-dfg  # Verilator 5.028 DFG peephole optimizer OOPS on WORD_SEL_BITS=0 in cache bank
 VL_FLAGS += --x-initial unique --x-assign unique
 VL_FLAGS += verilator.vlt
 VL_FLAGS += -DSIMULATION -DSV_DPI
