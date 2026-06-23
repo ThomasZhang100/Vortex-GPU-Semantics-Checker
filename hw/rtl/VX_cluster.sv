@@ -166,6 +166,74 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     `BUFFER_EX(busy, (| per_socket_busy), 1'b1, 1, (NUM_SOCKETS > 1));
 
+`ifdef SIMULATION
+    // -------------------------------------------------------------------------
+    // Global cache miss-rate counters.
+    //
+    // l1_miss_cnt : total L2 requests from core sockets (one per L1 cache miss).
+    // l2_miss_cnt : total DRAM requests from L2       (one per L2 cache miss).
+    // L2 miss rate = l2_miss_cnt / l1_miss_cnt
+    //
+    // Printed when busy falls (all warps have retired).
+    // Compare with/without CHECKER_ENABLE or DEAD_CYCLE to see checker impact.
+    // Filter: grep "MISS_RATE"
+    // -------------------------------------------------------------------------
+    localparam NUM_CORE_PORTS = NUM_SOCKETS * `L1_MEM_PORTS;
+
+    // Extract core port handshake signals into plain logic arrays so they can
+    // be iterated with variable indices in always_comb without Verilator issues.
+    logic core_port_fire [NUM_CORE_PORTS];
+    generate
+        for (genvar cp = 0; cp < NUM_CORE_PORTS; ++cp) begin : g_core_port_fire
+            assign core_port_fire[cp] = per_socket_mem_bus_if[cp].req_valid
+                                     && per_socket_mem_bus_if[cp].req_ready;
+        end
+    endgenerate
+
+    logic mem_port_fire [`L2_MEM_PORTS];
+    generate
+        for (genvar mp = 0; mp < `L2_MEM_PORTS; ++mp) begin : g_mem_port_fire
+            assign mem_port_fire[mp] = mem_bus_if[mp].req_valid
+                                    && mem_bus_if[mp].req_ready;
+        end
+    endgenerate
+
+    // Combinational reductions (counts per cycle).
+    logic [3:0] l1_fires;   // max NUM_CORE_PORTS
+    logic [2:0] l2_fires;   // max L2_MEM_PORTS
+    always_comb begin
+        l1_fires = '0;
+        for (int cp = 0; cp < NUM_CORE_PORTS; cp++)
+            if (core_port_fire[cp]) l1_fires++;
+        l2_fires = '0;
+        for (int mp = 0; mp < `L2_MEM_PORTS; mp++)
+            if (mem_port_fire[mp]) l2_fires++;
+    end
+
+    logic [63:0] l1_miss_cnt, l2_miss_cnt;
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            l1_miss_cnt <= '0;
+            l2_miss_cnt <= '0;
+        end else begin
+            l1_miss_cnt <= l1_miss_cnt + 64'(l1_fires);
+            l2_miss_cnt <= l2_miss_cnt + 64'(l2_fires);
+        end
+    end
+
+    // Print on falling edge of busy (all warps retired).
+    logic busy_prev;
+    always_ff @(posedge clk) busy_prev <= busy;
+
+    always @(posedge clk) begin
+        if (busy_prev && !busy) begin
+            `TRACE(1, ("%t: [MISS_RATE] l1_misses=%0d  l2_misses=%0d  l2_miss_pct=%0d\n",
+                $time, l1_miss_cnt, l2_miss_cnt,
+                (l1_miss_cnt > 0) ? (l2_miss_cnt * 100 / l1_miss_cnt) : 0))
+        end
+    end
+`endif // SIMULATION
+
 `ifdef CHECKER_ENABLE
     // DCR latch: captures VX_DCR_CHECKER_* writes from the host before vx_start.
     // Intentionally has no synchronous reset so values survive processor::run()'s
