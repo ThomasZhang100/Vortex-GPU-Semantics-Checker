@@ -667,9 +667,8 @@ module VX_cache import VX_gpu_pkg::*; #(
     assign cache_perf.crsp_stalls  = perf_crsp_stalls;
 `endif
 
+/* Cache simulation traces — uncomment `ifdef SIMULATION block to re-enable.
 `ifdef SIMULATION
-    // XBAR_STALL: fires when a port has a valid request but the xbar won't accept
-    // it (bank arbitration denied this cycle).  Keeps core_req_ready[pi] live.
     always @(posedge clk) begin
         for (int pi = 0; pi < NUM_REQS; pi++) begin
             if (core_req_valid[pi] && !core_req_ready[pi]) begin
@@ -679,7 +678,6 @@ module VX_cache import VX_gpu_pkg::*; #(
         end
     end
 
-    /* verilator lint_off UNUSEDSIGNAL */
     logic [NUM_BANKS-1:0]                    prev_bank_fire;
     logic [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0] prev_bank_idx;
 
@@ -690,7 +688,6 @@ module VX_cache import VX_gpu_pkg::*; #(
                 prev_bank_idx[b] <= per_bank_core_req_idx[b];
         end
     end
-    /* verilator lint_on UNUSEDSIGNAL */
 
     always @(posedge clk) begin
         for (int b = 0; b < NUM_BANKS; b++) begin
@@ -700,7 +697,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             end
         end
     end
-
 `endif
+*/
 
 endmodule

@@ -358,12 +358,19 @@ module VX_cluster import VX_gpu_pkg::*; #(
             any_core_req = any_core_req | snoop_valid[i];
     end
 
-    // Expand ASSIGN_VX_MEM_BUS_IF with req_valid gated on !any_core_req.
-    // Responses (rsp) are never gated — in-flight responses always complete.
+    // DEAD_CYCLE (define via CONFIGS="-DDEAD_CYCLE"): checker only issues L2
+    // requests during cycles when no core has a pending L2 request, giving
+    // cores 100% of L2 bandwidth.  Without DEAD_CYCLE the checker enters the
+    // L2 round-robin at equal priority, incurring potential contention.
     localparam CHK_L2_PORT = NUM_SOCKETS * `L1_MEM_PORTS;
+`ifdef DEAD_CYCLE
     assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_act_bus_if.req_valid && !any_core_req;
-    assign l2_core_bus_if[CHK_L2_PORT].req_data  = chk_act_bus_if.req_data;
     assign chk_act_bus_if.req_ready = l2_core_bus_if[CHK_L2_PORT].req_ready && !any_core_req;
+`else
+    assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_act_bus_if.req_valid;
+    assign chk_act_bus_if.req_ready = l2_core_bus_if[CHK_L2_PORT].req_ready;
+`endif
+    assign l2_core_bus_if[CHK_L2_PORT].req_data  = chk_act_bus_if.req_data;
     assign chk_act_bus_if.rsp_valid = l2_core_bus_if[CHK_L2_PORT].rsp_valid;
     assign chk_act_bus_if.rsp_data  = l2_core_bus_if[CHK_L2_PORT].rsp_data;
     assign l2_core_bus_if[CHK_L2_PORT].rsp_ready = chk_act_bus_if.rsp_ready;
