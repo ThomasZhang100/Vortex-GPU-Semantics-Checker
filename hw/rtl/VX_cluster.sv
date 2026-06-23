@@ -210,20 +210,25 @@ module VX_cluster import VX_gpu_pkg::*; #(
             if (mem_port_fire[mp]) l2_fires++;
     end
 
+    // Counters are NOT reset between kernel launches (no `if (reset)` clause).
+    // Between mode-2 GEMMs the processor issues a reset pulse; clearing counters
+    // there would lose GEMM1 data.  Instead they accumulate from power-on and we
+    // print on every falling edge of busy so the user sees both per-GEMM and
+    // cumulative numbers.
     logic [63:0] l1_miss_cnt, l2_miss_cnt;
     always_ff @(posedge clk) begin
-        if (reset) begin
-            l1_miss_cnt <= '0;
-            l2_miss_cnt <= '0;
-        end else begin
-            l1_miss_cnt <= l1_miss_cnt + 64'(l1_fires);
-            l2_miss_cnt <= l2_miss_cnt + 64'(l2_fires);
-        end
+        l1_miss_cnt <= l1_miss_cnt + 64'(l1_fires);
+        l2_miss_cnt <= l2_miss_cnt + 64'(l2_fires);
     end
 
-    // Print on falling edge of busy (all warps retired).
+    // Print on every falling edge of busy (once per vx_start/vx_ready_wait pair).
+    // Mode 1/3: one print at kernel end.
+    // Mode 2: two prints — one after GEMM1, one after GEMM2.
+    // The LAST print before PERF contains the cumulative miss counts.
     logic busy_prev;
-    always_ff @(posedge clk) busy_prev <= busy;
+    always_ff @(posedge clk)
+        if (reset) busy_prev <= 1'b0;  // prevent spurious edge at time=1
+        else       busy_prev <= busy;
 
     // core_l2_miss_cnt: l2_miss_cnt minus checker-caused DRAM fetches.
     // With CHECKER_ENABLE the checker's cold misses are subtracted out below;
@@ -237,9 +242,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     /* verilator lint_off BLKSEQ */
     /* verilator lint_off WIDTHTRUNC */
     always @(posedge clk) begin
-        if (reset) begin
-            chk_l2_miss_cnt <= '0;
-        end else if (chk_req_fire) begin
+        if (chk_req_fire) begin
             automatic longint unsigned addr = longint'(chk_act_bus_if.req_data.addr);
             if (chk_seen_addrs.exists(addr) == 0) begin
                 chk_seen_addrs[addr] = 1;
