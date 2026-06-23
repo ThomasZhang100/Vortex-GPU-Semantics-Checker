@@ -498,11 +498,13 @@ module VX_cluster import VX_gpu_pkg::*; #(
     int unsigned prefetch_time [longint unsigned]; // laddr → $time when checker fetched
     bit          core_seen     [longint unsigned]; // laddr → true once a core has logged
 
+    /* verilator lint_off BLKSEQ */
+    /* verilator lint_off WIDTHTRUNC */
     always @(posedge clk) begin
         // Record every unique line the checker fetches.
         if (checker_armed && chk_req_fire) begin
             automatic longint unsigned laddr = longint'(chk_act_bus_if.req_data.addr);
-            if (!prefetch_time.exists(laddr)) begin
+            if (prefetch_time.exists(laddr) == 0) begin
                 prefetch_time[laddr] = int'($time);
                 `TRACE(2, ("%t: [PREFETCH_LOAD] checker fetched laddr=0x%0h  byte=0x%0h\n",
                     $time, laddr, laddr << CHK_LINE_BITS))
@@ -513,10 +515,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
         for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
             if (snoop_valid[ci] && snoop_ready[ci] && !snoop_rw[ci]) begin
                 automatic longint unsigned laddr = longint'(snoop_laddr[ci]);
-                if (!core_seen.exists(laddr)) begin
+                if (core_seen.exists(laddr) == 0) begin
                     core_seen[laddr] = 1;
-                    if (prefetch_time.exists(laddr)) begin
-                        `TRACE(2, ("%t: [PREFETCH_HIT] core_port=%0d  laddr=0x%0h  byte=0x%0h  checker_loaded=%0t  lag=%0d_cyc\n",
+                    if (prefetch_time.exists(laddr) != 0) begin
+                        `TRACE(2, ("%t: [PREFETCH_HIT] core_port=%0d  laddr=0x%0h  byte=0x%0h  checker_loaded_at=%0t  lag=%0d_cyc\n",
                             $time, ci,
                             laddr, laddr << CHK_LINE_BITS,
                             prefetch_time[laddr],
@@ -529,6 +531,8 @@ module VX_cluster import VX_gpu_pkg::*; #(
             end
         end
     end
+    /* verilator lint_on WIDTHTRUNC */
+    /* verilator lint_on BLKSEQ */
 
     // -------------------------------------------------------------------------
     // Checker-window stall summary:
