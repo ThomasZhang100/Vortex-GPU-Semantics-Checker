@@ -481,6 +481,56 @@ module VX_cluster import VX_gpu_pkg::*; #(
     end
 
     // -------------------------------------------------------------------------
+    // Prefetch-effect trace (PREFETCH).
+    //
+    // Answers: when a core port first requests an L2 line, did the checker
+    // already load it into L2?  The checker's A-matrix reads run ahead of
+    // GEMM's A-matrix reads with e=1 (or even e=3 when it arms early enough).
+    //
+    // PREFETCH_LOADED  → checker fetched this line BEFORE the core's first
+    //                    request → core gets an L2 hit instead of DRAM miss.
+    // COLD_MISS        → core is first; checker hadn't loaded this line.
+    //
+    // Runs at TRACE level 2 so it fires even in standard debug runs.
+    // Filter: grep "PREFETCH"
+    // -------------------------------------------------------------------------
+    // Associative arrays indexed by longint: Verilator-safe.
+    int unsigned prefetch_time [longint unsigned]; // laddr → $time when checker fetched
+    bit          core_seen     [longint unsigned]; // laddr → true once a core has logged
+
+    always @(posedge clk) begin
+        // Record every unique line the checker fetches.
+        if (checker_armed && chk_req_fire) begin
+            automatic longint unsigned laddr = longint'(chk_act_bus_if.req_data.addr);
+            if (!prefetch_time.exists(laddr)) begin
+                prefetch_time[laddr] = int'($time);
+                `TRACE(2, ("%t: [PREFETCH_LOAD] checker fetched laddr=0x%0h  byte=0x%0h\n",
+                    $time, laddr, laddr << CHK_LINE_BITS))
+            end
+        end
+
+        // First time any core port requests a line: log whether checker had it.
+        for (int ci = 0; ci < CHK_SNOOP_N; ci++) begin
+            if (snoop_valid[ci] && snoop_ready[ci] && !snoop_rw[ci]) begin
+                automatic longint unsigned laddr = longint'(snoop_laddr[ci]);
+                if (!core_seen.exists(laddr)) begin
+                    core_seen[laddr] = 1;
+                    if (prefetch_time.exists(laddr)) begin
+                        `TRACE(2, ("%t: [PREFETCH_HIT] core_port=%0d  laddr=0x%0h  byte=0x%0h  checker_loaded=%0t  lag=%0d_cyc\n",
+                            $time, ci,
+                            laddr, laddr << CHK_LINE_BITS,
+                            prefetch_time[laddr],
+                            (int'($time) - int'(prefetch_time[laddr])) / 2))
+                    end else begin
+                        `TRACE(2, ("%t: [COLD_MISS] core_port=%0d  laddr=0x%0h  byte=0x%0h\n",
+                            $time, ci, laddr, laddr << CHK_LINE_BITS))
+                    end
+                end
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
     // Checker-window stall summary:
     //   chk_window_active: high from first chk_req_fire (after arm) to all_done
     //   chk_window_stall_cnt: cycles where ANY core port had req_valid=1 but
