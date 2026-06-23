@@ -13,10 +13,7 @@
 
 `include "VX_platform.vh"
 
-// TRACING_OFF intentionally omitted: Verilator 5.028 DFG peephole uses
-// tracing_off as permission to constant-fold grant_index when the checker
-// port is always gated (NUM_REQS=5 case).  Leaving this module traceable
-// prevents that fold without requiring --trace or VCD output.
+`TRACING_OFF
 module VX_rr_arbiter #(
     parameter NUM_REQS = 1,
     parameter MODEL    = 1,

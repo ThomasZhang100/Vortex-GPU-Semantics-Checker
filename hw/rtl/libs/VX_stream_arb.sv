@@ -130,11 +130,16 @@ module VX_stream_arb #(
                 wire [NUM_OUTPUTS-1:0] requests;
                 for (genvar o = 0; o < NUM_OUTPUTS; ++o) begin : g_o
                     localparam i = r * NUM_OUTPUTS + o;
-                    // i may exceed NUM_INPUTS-1 when NUM_INPUTS is not a multiple of NUM_OUTPUTS.
-                    // Verilog returns 'x for out-of-range selects; suppress the Verilator warning.
-                    /* verilator lint_off SELRANGE */
-                    assign requests[o] = valid_in[i];
-                    /* verilator lint_on SELRANGE */
+                    // When NUM_INPUTS is not a multiple of NUM_OUTPUTS, i can exceed
+                    // NUM_INPUTS-1 (e.g. 5 inputs / 2 outputs -> NUM_REQS=3, max i=5).
+                    // valid_in[i] out of range returns X, which corrupts arb_requests
+                    // and the round-robin grant -> intermittent deadlock.  Tie the
+                    // out-of-range lanes to 0 so they never request.
+                    if (i < NUM_INPUTS) begin : g_in
+                        assign requests[o] = valid_in[i];
+                    end else begin : g_pad
+                        assign requests[o] = 1'b0;
+                    end
                 end
                 assign arb_requests[r] = (| requests);
             end
@@ -162,11 +167,14 @@ module VX_stream_arb #(
                 wire [NUM_REQS-1:0][DATAW-1:0] data_in_w;
                 for (genvar r = 0; r < NUM_REQS; ++r) begin : g_r
                     localparam i = r * NUM_OUTPUTS + o;
-                    if (r < NUM_INPUTS) begin : g_valid
-                        /* verilator lint_off SELRANGE */
+                    // Guard must test i, not r: i = r*NUM_OUTPUTS+o can exceed
+                    // NUM_INPUTS-1 even when r < NUM_INPUTS (e.g. 5 inputs / 2
+                    // outputs -> i reaches 5).  The original r<NUM_INPUTS guard
+                    // let valid_in[i]/data_in[i] read out of range, returning X
+                    // that propagated into valid_out_w and deadlocked the arbiter.
+                    if (i < NUM_INPUTS) begin : g_valid
                         assign valid_in_w[r] = valid_in[i];
                         assign data_in_w[r]  = data_in[i];
-                        /* verilator lint_on SELRANGE */
                     end else begin : g_padding
                         assign valid_in_w[r] = 0;
                         assign data_in_w[r]  = '0;
