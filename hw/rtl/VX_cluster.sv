@@ -225,11 +225,42 @@ module VX_cluster import VX_gpu_pkg::*; #(
     logic busy_prev;
     always_ff @(posedge clk) busy_prev <= busy;
 
+    // core_l2_miss_cnt: l2_miss_cnt minus checker-caused DRAM fetches.
+    // With CHECKER_ENABLE the checker's cold misses are subtracted out below;
+    // without it every DRAM fetch came from a core, so no adjustment needed.
+`ifdef CHECKER_ENABLE
+    // Count first-time checker L2 fetches (= checker cold misses = DRAM fetches
+    // caused by the checker).  Repeat accesses to the same line are L2 hits.
+    logic [63:0] chk_l2_miss_cnt;
+    int unsigned chk_seen_addrs [longint unsigned];
+
+    /* verilator lint_off BLKSEQ */
+    /* verilator lint_off WIDTHTRUNC */
+    always @(posedge clk) begin
+        if (reset) begin
+            chk_l2_miss_cnt <= '0;
+        end else if (chk_req_fire) begin
+            automatic longint unsigned addr = longint'(chk_act_bus_if.req_data.addr);
+            if (chk_seen_addrs.exists(addr) == 0) begin
+                chk_seen_addrs[addr] = 1;
+                chk_l2_miss_cnt <= chk_l2_miss_cnt + 64'd1;
+            end
+        end
+    end
+    /* verilator lint_on WIDTHTRUNC */
+    /* verilator lint_on BLKSEQ */
+
+    wire [63:0] core_l2_miss_cnt = l2_miss_cnt - chk_l2_miss_cnt;
+`else
+    wire [63:0] core_l2_miss_cnt = l2_miss_cnt;
+    wire [63:0] chk_l2_miss_cnt  = '0;
+`endif
+
     always @(posedge clk) begin
         if (busy_prev && !busy) begin
-            `TRACE(1, ("%t: [MISS_RATE] l1_misses=%0d  l2_misses=%0d  l2_miss_pct=%0d\n",
-                $time, l1_miss_cnt, l2_miss_cnt,
-                (l1_miss_cnt > 0) ? (l2_miss_cnt * 100 / l1_miss_cnt) : 0))
+            `TRACE(1, ("%t: [MISS_RATE] l1_misses=%0d  l2_misses_core=%0d  l2_misses_chk=%0d  l2_miss_pct=%0d\n",
+                $time, l1_miss_cnt, core_l2_miss_cnt, chk_l2_miss_cnt,
+                (l1_miss_cnt > 0) ? (core_l2_miss_cnt * 100 / l1_miss_cnt) : 0))
         end
     end
 `endif // SIMULATION
