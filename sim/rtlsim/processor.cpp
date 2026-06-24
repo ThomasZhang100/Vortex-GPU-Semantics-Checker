@@ -168,6 +168,12 @@ public:
       this->tick();
     }
 
+    // Clock a few extra idle cycles so end-of-kernel falling-edge traces
+    // (e.g. MISS_RATE, which fires on busy 1->0) are observed before reset.
+    for (int i = 0; i < 4; ++i) {
+      this->tick();
+    }
+
     // stop
     device_->reset = 1;
 

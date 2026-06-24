@@ -268,7 +268,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
 `endif
 
     always @(posedge clk) begin
-        if (busy_prev && !busy) begin
+        if (!reset && busy_prev && !busy) begin
             `TRACE(1, ("%t: [MISS_RATE] l1_misses=%0d  l2_misses_core=%0d  l2_misses_chk=%0d  l2_miss_pct=%0d\n",
                 $time, l1_miss_cnt, core_l2_miss_cnt, chk_l2_miss_cnt,
                 (l1_miss_cnt > 0) ? (core_l2_miss_cnt * 100 / l1_miss_cnt) : 0))
