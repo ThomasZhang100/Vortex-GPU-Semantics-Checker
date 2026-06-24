@@ -52,6 +52,23 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
 
     reg [CTR_WIDTH-1:0] counter;
 
+`ifdef CACHE_PERSIST
+    // Cache-persistence across kernel launches (opt-in via CONFIGS="-DCACHE_PERSIST").
+    // On a normal reset the sequencer walks every line in STATE_INIT writing valid=0,
+    // clearing the cache.  The tag SRAM (VX_dp_ram, RESET_RAM=0) is NOT cleared by the
+    // reset signal itself, so skipping STATE_INIT preserves cached contents.
+    //
+    // cold_done has NO reset, so it survives the per-kernel-launch reset pulse and (in
+    // the Verilator model) persists between processor::run() invocations:
+    //   first reset:  cold_done=0 -> run STATE_INIT once (initialize SRAM valid bits)
+    //   later resets: cold_done=1 -> skip to STATE_IDLE, retaining cached lines
+    reg cold_done;
+    initial cold_done = 1'b0;
+    wire do_cold_init = !cold_done;
+`else
+    wire do_cold_init = 1'b1;
+`endif
+
     always @(*) begin
         state_n = state;
         case (state)
@@ -94,8 +111,13 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
 
     always @(posedge clk) begin
         if (reset) begin
-            state   <= STATE_INIT;
+            // Cold reset runs STATE_INIT to clear valid bits; warm reset (CACHE_PERSIST
+            // with cold_done already set) skips straight to IDLE, preserving the SRAM.
+            state   <= 3'(do_cold_init ? STATE_INIT : STATE_IDLE);
             counter <= '0;
+`ifdef CACHE_PERSIST
+            cold_done <= 1'b1;  // mark the one-time cold init as consumed
+`endif
         end else begin
             state <= state_n;
             if (state != STATE_IDLE) begin
