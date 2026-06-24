@@ -168,11 +168,42 @@ public:
       this->tick();
     }
 
-    // Clock a few extra idle cycles so end-of-kernel falling-edge traces
-    // (e.g. MISS_RATE, which fires on busy 1->0) are observed before reset.
+    // Clock a few idle cycles so end-of-kernel falling-edge traces (e.g. MISS_RATE,
+    // which fires on busy 1->0) are observed before reset.  Cheap and harmless:
+    // the cores are already idle.  Applies to all runs since MISS_RATE is a general
+    // SIMULATION trace, not specific to CACHE_PERSIST.
     for (int i = 0; i < 4; ++i) {
       this->tick();
     }
+
+#ifdef CACHE_PERSIST
+    // Drain the memory system before reset.  With CACHE_PERSIST the L2 retains
+    // its contents across the inter-kernel reset; if reset interrupts an in-flight
+    // fill/eviction/writeback, the write-back L2's tag dirty-bit and dirty-byte
+    // tracking are left inconsistent and persist into the next kernel (tripping
+    // the VX_cache_bank dirty-byte assertion).  Tick until no DRAM traffic is
+    // in flight and the device has stayed idle for a stable window, so the L2
+    // reaches a consistent quiescent state.  This also lets end-of-kernel
+    // falling-edge traces (MISS_RATE) fire before reset.
+    {
+      const int STABLE_IDLE = 8;
+      int idle_run = 0;
+      int guard = 0;
+      const int MAX_DRAIN = 100000;
+      while (idle_run < STABLE_IDLE && guard++ < MAX_DRAIN) {
+        this->tick();
+        bool mem_idle = true;
+        for (int b = 0; b < PLATFORM_MEMORY_NUM_BANKS; ++b) {
+          if (!pending_mem_reqs_[b].empty() || !dram_queue_[b].empty()
+              || device_->mem_req_valid[b]) {
+            mem_idle = false;
+            break;
+          }
+        }
+        idle_run = (mem_idle && !device_->busy) ? (idle_run + 1) : 0;
+      }
+    }
+#endif
 
     // stop
     device_->reset = 1;
