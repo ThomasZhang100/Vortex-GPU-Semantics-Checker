@@ -72,6 +72,11 @@ const char* thresh_file  = nullptr; // -C: uint16 threshold binary [num_features
 //        Checker trigger (e=3 sub-mode) fires on first B-matrix read in GEMM2.
 // -e 3: address-range trigger mode.
 static int ENABLE_MODE   = 1;
+// -X: structural control.  Runs the GEMM(s) exactly as the chosen mode but skips
+// ALL checker DCR writes (weights, thresholds, address, ENABLE), so with
+// CHECKER_ENABLE the checker port exists in the L2 arbiter but never issues a
+// request.  Isolates structural (port/arbiter-width) overhead from checker activity.
+static bool NO_ARM       = false;
 
 vx_device_h device       = nullptr;
 vx_buffer_h A_buffer     = nullptr;   // [M x K] FP32 "hidden states" — checker's tap
@@ -99,11 +104,16 @@ static void show_usage() {
     std::cout << "       Checker taps A_hidden; ENABLE(3) written after GEMM1 so A is complete" << std::endl;
     std::cout << "       before the checker reads it; checker fires on first B-matrix L2 read" << std::endl;
     std::cout << "  3: addr-range trigger (single GEMM, checker waits for B-matrix L2 read)" << std::endl;
+    std::cout << "  -X: structural control — configure the GEMM(s) exactly as the chosen" << std::endl;
+    std::cout << "      mode but never write the checker ENABLE/config DCRs, so the checker" << std::endl;
+    std::cout << "      hardware (and its L2 port) is present but fully idle.  Use with" << std::endl;
+    std::cout << "      CHECKER_ENABLE to isolate the arbiter/port structural overhead from" << std::endl;
+    std::cout << "      the checker's actual activity." << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "k:oA:W:C:e:T:F:H:N:t:h")) != -1) {
+    while ((c = getopt(argc, argv, "k:oA:W:C:e:T:F:H:N:t:Xh")) != -1) {
         switch (c) {
         case 'k': kernel_file   = optarg;        break;
         case 'o': ones_activation = true;        break;
@@ -111,6 +121,7 @@ static void parse_args(int argc, char** argv) {
         case 'W': weight_file   = optarg;        break;
         case 'C': thresh_file   = optarg;        break;
         case 'e': ENABLE_MODE   = atoi(optarg);  break;
+        case 'X': NO_ARM        = true;          break;
         case 'T': NUM_TOKENS    = atoi(optarg);  break;
         case 'F': NUM_FEATURES  = atoi(optarg);  break;
         case 'H': HIDDEN_SIZE   = atoi(optarg);  break;
@@ -357,12 +368,16 @@ int main(int argc, char* argv[]) {
     // DCR writes are always issued regardless of CHECKER_ENABLE in RTL:
     // without it the decoder silently drops them, so the GEMM runs unchanged.
     // -----------------------------------------------------------------------
-    if (weight_file) {
+    if (NO_ARM) {
+        printf("NO_ARM (-X): skipping all checker DCR writes; checker stays idle "
+               "(structural-overhead control)\n");
+    }
+    if (!NO_ARM && weight_file) {
         printf("Loading checker weights from '%s' (%d rows × %d features)\n",
                weight_file, K, VX_CHECKER_MAX_FEATURES);
         load_checker_weights(device, weight_file, K);
     }
-    if (thresh_file) {
+    if (!NO_ARM && thresh_file) {
         printf("Loading checker thresholds from '%s' (%d entries)\n",
                thresh_file, NUM_FEATURES + 1);
         load_checker_thresholds(device, thresh_file, NUM_FEATURES);
@@ -373,8 +388,9 @@ int main(int argc, char* argv[]) {
     // For modes 1 and 3 the ENABLE DCR is written now.
     // For mode 2 the ENABLE DCR is deferred until after GEMM1 completes so
     // the hidden states are fully written before the checker reads them.
+    // Skipped entirely under -X (NO_ARM).
     // -----------------------------------------------------------------------
-    {
+    if (!NO_ARM) {
         uint64_t trig_lo = B_addr;
         uint64_t trig_hi = B_addr + b_size;
         int arm_mode = (ENABLE_MODE == 2) ? 3 : ENABLE_MODE;  // mode 2 uses addr-trigger
@@ -420,8 +436,11 @@ int main(int argc, char* argv[]) {
         RT_CHECK(vx_ready_wait(device, VX_MAX_TIMEOUT));
 
         // Arm checker with addr-trigger now that A_hidden is fully written.
-        printf("Arming checker after GEMM1: ENABLE=3 (addr-trigger on B reads)\n");
-        RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, 3));
+        // Skipped under -X so the checker never fires (structural control).
+        if (!NO_ARM) {
+            printf("Arming checker after GEMM1: ENABLE=3 (addr-trigger on B reads)\n");
+            RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_ENABLE, 3));
+        }
 
         std::cout << "start GEMM2 (A_hidden * B -> C)" << std::endl;
         RT_CHECK(vx_start(device, krnl_buffer, args_buffer));
