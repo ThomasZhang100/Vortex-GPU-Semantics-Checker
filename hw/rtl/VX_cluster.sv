@@ -215,7 +215,14 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // there would lose GEMM1 data.  Instead they accumulate from power-on and we
     // print on every falling edge of busy so the user sees both per-GEMM and
     // cumulative numbers.
+    // initial (not reset) so they start at 0 yet survive the inter-kernel reset
+    // pulse, accumulating across both mode-2 GEMMs.  No reset clause: a reset
+    // here would zero the counts between GEMMs.
     logic [63:0] l1_miss_cnt, l2_miss_cnt;
+    initial begin
+        l1_miss_cnt = '0;
+        l2_miss_cnt = '0;
+    end
     always_ff @(posedge clk) begin
         l1_miss_cnt <= l1_miss_cnt + 64'(l1_fires);
         l2_miss_cnt <= l2_miss_cnt + 64'(l2_fires);
@@ -225,10 +232,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // Mode 1/3: one print at kernel end.
     // Mode 2: two prints — one after GEMM1, one after GEMM2.
     // The LAST print before PERF contains the cumulative miss counts.
+    // initial=0 avoids a spurious X-driven edge at time 0.
     logic busy_prev;
-    always_ff @(posedge clk)
-        if (reset) busy_prev <= 1'b0;  // prevent spurious edge at time=1
-        else       busy_prev <= busy;
+    initial busy_prev = 1'b0;
+    always_ff @(posedge clk) busy_prev <= busy;
 
     // core_l2_miss_cnt: l2_miss_cnt minus checker-caused DRAM fetches.
     // With CHECKER_ENABLE the checker's cold misses are subtracted out below;
@@ -238,6 +245,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // caused by the checker).  Repeat accesses to the same line are L2 hits.
     logic [63:0] chk_l2_miss_cnt;
     int unsigned chk_seen_addrs [longint unsigned];
+    initial chk_l2_miss_cnt = '0;
 
     /* verilator lint_off BLKSEQ */
     /* verilator lint_off WIDTHTRUNC */
