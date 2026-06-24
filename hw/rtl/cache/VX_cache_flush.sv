@@ -113,11 +113,11 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
         if (reset) begin
             // Cold reset runs STATE_INIT to clear valid bits; warm reset (CACHE_PERSIST
             // with cold_done already set) skips straight to IDLE, preserving the SRAM.
+            // NOTE: cold_done is NOT set here.  Reset is asserted for several cycles;
+            // setting it here would flip do_cold_init mid-pulse and abort the init
+            // walk on the cold launch.  It is set below only when STATE_INIT finishes.
             state   <= 3'(do_cold_init ? STATE_INIT : STATE_IDLE);
             counter <= '0;
-`ifdef CACHE_PERSIST
-            cold_done <= 1'b1;  // mark the one-time cold init as consumed
-`endif
         end else begin
             state <= state_n;
             if (state != STATE_IDLE) begin
@@ -128,6 +128,12 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
             end else begin
                 counter <= '0;
             end
+`ifdef CACHE_PERSIST
+            // Mark the one-time cold init consumed when the INIT walk completes.
+            // After this, subsequent (warm) resets skip STATE_INIT and preserve SRAM.
+            if (state == STATE_INIT && counter == CTR_WIDTH'((2 ** `CS_LINE_SEL_BITS)-1))
+                cold_done <= 1'b1;
+`endif
         end
     end
 
