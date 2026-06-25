@@ -63,10 +63,22 @@ module VX_cache_data import VX_gpu_pkg::*; #(
 
         wire [NUM_WAYS-1:0][LINE_SIZE-1:0] byteen_rdata;
 
+        // Flush dirty-byte handling.  Normally a flush clears the dirty-byte SRAM
+        // (byteen_wdata=0 on flush).  Under CACHE_PERSIST the matching tag store
+        // keeps the line marked dirty (see VX_cache_tags), so the dirty-byte store
+        // must ALSO be preserved on flush — otherwise tag.dirty=1 disagrees with
+        // dirty_bytes=0 and trips the consistency assertion in VX_cache_bank.
+        // The READ on flush is kept so the writeback still gets the dirty bytes.
+        // This block only exists for write-back caches (DIRTY_BYTES != 0).
+`ifdef CACHE_PERSIST
+        wire byteen_flush = 1'b0; // keep dirty bytes resident across the flush
+`else
+        wire byteen_flush = flush;
+`endif
         for (genvar i = 0; i < NUM_WAYS; ++i) begin : g_byteen_store
             wire [LINE_SIZE-1:0] byteen_wdata = {LINE_SIZE{write}}; // only asserted on writes
-            wire [LINE_SIZE-1:0] byteen_wren = {LINE_SIZE{init || fill || flush}} | write_mask;
-            wire byteen_write = ((fill || flush) && ((NUM_WAYS == 1) || (evict_way == i)))
+            wire [LINE_SIZE-1:0] byteen_wren = {LINE_SIZE{init || fill || byteen_flush}} | write_mask;
+            wire byteen_write = ((fill || byteen_flush) && ((NUM_WAYS == 1) || (evict_way == i)))
                              || (write && tag_matches[i])
                              || init;
             wire byteen_read  = fill || flush;
