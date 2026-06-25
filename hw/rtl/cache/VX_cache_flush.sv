@@ -118,6 +118,17 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
             // walk on the cold launch.  It is set below only when STATE_INIT finishes.
             state   <= 3'(do_cold_init ? STATE_INIT : STATE_IDLE);
             counter <= '0;
+`ifdef CACHE_PERSIST
+`ifdef SIMULATION
+            // Diagnostic: fires on the FIRST reset cycle of each launch (state was
+            // not already IDLE-from-reset).  do_cold_init=1 -> clearing cache;
+            // do_cold_init=0 -> preserving cache (persistence engaged).
+            if (BANK_ID == 0 && state != STATE_INIT)
+                `TRACE(1, ("%t: [CACHE_PERSIST] cache_size=%0d reset: do_cold_init=%0b (%s)\n",
+                    $time, CACHE_SIZE, do_cold_init,
+                    do_cold_init ? "CLEARING cache" : "PRESERVING cache"))
+`endif
+`endif
         end else begin
             state <= state_n;
             if (state != STATE_IDLE) begin
