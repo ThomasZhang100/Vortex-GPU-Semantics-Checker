@@ -237,6 +237,43 @@ module VX_cluster import VX_gpu_pkg::*; #(
     initial busy_prev = 1'b0;
     always_ff @(posedge clk) busy_prev <= busy;
 
+    // -------------------------------------------------------------------------
+    // Per-kernel cycle counter + start/end traces.
+    //
+    // cyc_cnt resets to 0 on each vx_start's reset pulse, so it measures cycles
+    // within one kernel launch.  kernel_idx counts launches (1=GEMM1, 2=GEMM2,
+    // ... in mode 2).  Captures cyc_cnt at the busy rising edge (KERNEL_START)
+    // and reports the elapsed count at the falling edge (KERNEL_END).
+    // Filter: grep "KERNEL_START\|KERNEL_END"
+    // -------------------------------------------------------------------------
+    logic [63:0] cyc_cnt;
+    logic [31:0] kernel_idx;
+    logic [63:0] kernel_start_cyc;
+    initial begin
+        cyc_cnt          = '0;
+        kernel_idx       = '0;
+        kernel_start_cyc = '0;
+    end
+    always_ff @(posedge clk) begin
+        if (reset) cyc_cnt <= '0;          // restart per-kernel counter each launch
+        else       cyc_cnt <= cyc_cnt + 64'd1;
+    end
+
+    always @(posedge clk) begin
+        // Rising edge of busy: kernel begins executing.
+        if (!reset && !busy_prev && busy) begin
+            kernel_start_cyc <= cyc_cnt;
+            kernel_idx       <= kernel_idx + 32'd1;
+            `TRACE(1, ("%t: [KERNEL_START] kernel=%0d  start_cycle=%0d\n",
+                $time, kernel_idx + 32'd1, cyc_cnt))
+        end
+        // Falling edge of busy: kernel finished.
+        if (!reset && busy_prev && !busy) begin
+            `TRACE(1, ("%t: [KERNEL_END] kernel=%0d  end_cycle=%0d  duration=%0d cycles\n",
+                $time, kernel_idx, cyc_cnt, cyc_cnt - kernel_start_cyc))
+        end
+    end
+
     // core_l2_miss_cnt: l2_miss_cnt minus checker-caused DRAM fetches.
     // With CHECKER_ENABLE the checker's cold misses are subtracted out below;
     // without it every DRAM fetch came from a core, so no adjustment needed.
