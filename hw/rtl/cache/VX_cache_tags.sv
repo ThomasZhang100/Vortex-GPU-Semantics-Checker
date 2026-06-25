@@ -71,8 +71,26 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
         wire do_flush = flush && (!WRITEBACK || way_en); // flush all ways in writethrough mode
         wire do_write = WRITEBACK && write && tag_matches[i]; // only write on tag hit
 
+        // Flush invalidation control.
+        // Normally a flush writes the tag store with valid=0 (invalidate).  The
+        // dirty-data writeback to DRAM happens separately in VX_cache_bank via the
+        // mem-request path and does NOT depend on this tag write.
+        //
+        // Under CACHE_PERSIST, a WRITEBACK cache (L2) skips the tag write on flush:
+        // the dirty line is still written back to DRAM, but the tag store is left
+        // untouched, so {valid, dirty, tag} are preserved and the line stays
+        // resident.  This lets data survive the kernel-exit fence flush so the
+        // next kernel can reuse it from L2.  (The line stays marked dirty; a later
+        // flush simply writes it back again — redundant but correct.)
+        // Write-through caches (L1) still invalidate on flush.
+`ifdef CACHE_PERSIST
+        wire do_flush_inval = do_flush && !WRITEBACK;
+`else
+        wire do_flush_inval = do_flush;
+`endif
+
         //wire line_read  = read || write || (WRITEBACK && (fill || flush));
-        wire line_write = do_init || do_fill || do_flush || do_write;
+        wire line_write = do_init || do_fill || do_flush_inval || do_write;
         wire line_valid = fill || write;
 
         wire [TAG_WIDTH-1:0] line_wdata, line_rdata;
