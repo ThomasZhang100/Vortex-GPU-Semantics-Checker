@@ -689,6 +689,73 @@ module VX_cluster import VX_gpu_pkg::*; #(
     /* verilator lint_on BLKSEQ */
 
     // -------------------------------------------------------------------------
+    // Checker L2 hit/miss classification (CHK_L2).
+    //
+    // PREFETCH_LOAD above only logs that the checker *issued* a request — it does
+    // NOT say whether that request hit in L2 or went to DRAM.  This block answers
+    // that directly by timing each checker request on its dedicated L2 port:
+    //   L2 hit  -> response returns in a few cycles (bank pipeline + queues)
+    //   L2 miss -> response waits for DRAM (~hundreds of cycles)
+    // Requests are tagged by row with at most one in-flight per row, so the
+    // request->response pair is matched on tag.value (row id).
+    //
+    // With CACHE_PERSIST + mode 2, A_hidden written by GEMM1 stays L2-resident,
+    // so the checker's reads in GEMM2 should be HITs.  Without persistence they
+    // would be MISSes (DRAM fetches).
+    //
+    // CHK_HIT_LAT_MAX separates the two latency modes; the actual latency is
+    // printed per response so the bimodal split is visible.
+    // Filter: grep "CHK_L2"
+    // -------------------------------------------------------------------------
+    localparam int CHK_HIT_LAT_MAX = 30; // cycles; L2 hit << DRAM miss latency
+
+    int unsigned chk_req_cyc [longint unsigned]; // tag(row) -> cyc_cnt at request
+    logic [63:0] chk_l2_hits, chk_l2_misses;
+    initial begin
+        chk_l2_hits   = '0;
+        chk_l2_misses = '0;
+    end
+
+    wire chk_rsp_fire = chk_act_bus_if.rsp_valid && chk_act_bus_if.rsp_ready;
+
+    /* verilator lint_off BLKSEQ */
+    /* verilator lint_off WIDTHTRUNC */
+    always @(posedge clk) begin
+        if (chk_req_fire) begin
+            automatic longint unsigned rtag = longint'(chk_act_bus_if.req_data.tag.value);
+            chk_req_cyc[rtag] = cyc_cnt;
+        end
+        if (chk_rsp_fire) begin
+            automatic longint unsigned rtag = longint'(chk_act_bus_if.rsp_data.tag.value);
+            if (chk_req_cyc.exists(rtag) != 0) begin
+                automatic int unsigned lat = int'(cyc_cnt) - int'(chk_req_cyc[rtag]);
+                if (lat <= CHK_HIT_LAT_MAX) begin
+                    chk_l2_hits <= chk_l2_hits + 64'd1;
+                    `TRACE(2, ("%t: [CHK_L2_HIT]  tag=%0d  latency=%0d cyc\n",
+                        $time, rtag, lat))
+                end else begin
+                    chk_l2_misses <= chk_l2_misses + 64'd1;
+                    `TRACE(2, ("%t: [CHK_L2_MISS] tag=%0d  latency=%0d cyc\n",
+                        $time, rtag, lat))
+                end
+            end
+        end
+    end
+    /* verilator lint_on WIDTHTRUNC */
+    /* verilator lint_on BLKSEQ */
+
+    // Summary when the checker finishes its run.
+    always @(posedge clk) begin
+        if (chk_all_done) begin
+            `TRACE(1, ("%t: [CHK_L2_SUMMARY] hits=%0d  misses=%0d  hit_pct=%0d  (lat_thresh=%0d cyc)\n",
+                $time, chk_l2_hits, chk_l2_misses,
+                ((chk_l2_hits + chk_l2_misses) > 0)
+                    ? (chk_l2_hits * 100 / (chk_l2_hits + chk_l2_misses)) : 0,
+                CHK_HIT_LAT_MAX))
+        end
+    end
+
+    // -------------------------------------------------------------------------
     // Checker-window stall summary:
     //   chk_window_active: high from first chk_req_fire (after arm) to all_done
     //   chk_window_stall_cnt: cycles where ANY core port had req_valid=1 but
