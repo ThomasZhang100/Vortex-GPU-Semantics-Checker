@@ -689,69 +689,73 @@ module VX_cluster import VX_gpu_pkg::*; #(
     /* verilator lint_on BLKSEQ */
 
     // -------------------------------------------------------------------------
-    // Checker L2 hit/miss classification (CHK_L2).
+    // DRAM-range read counter (DRAM_TAP) — ground-truth L2 hit/miss for the tap.
     //
-    // PREFETCH_LOAD above only logs that the checker *issued* a request — it does
-    // NOT say whether that request hit in L2 or went to DRAM.  This block answers
-    // that directly by timing each checker request on its dedicated L2 port:
-    //   L2 hit  -> response returns in a few cycles (bank pipeline + queues)
-    //   L2 miss -> response waits for DRAM (~hundreds of cycles)
-    // Requests are tagged by row with at most one in-flight per row, so the
-    // request->response pair is matched on tag.value (row id).
+    // Counts actual DRAM read requests (at the cluster's mem_bus_if, the real
+    // L2->DRAM port) whose byte address falls in the checker's tap range
+    // [hidden_base, hidden_base + batch*hidden*4).  A DRAM read in that range
+    // means the line was NOT L2-resident (an L2 miss); zero such reads means the
+    // tap data was served entirely from L2 (hits).  Unlike latency, this directly
+    // observes whether the bytes came from DRAM — no threshold guessing.
     //
-    // With CACHE_PERSIST + mode 2, A_hidden written by GEMM1 stays L2-resident,
-    // so the checker's reads in GEMM2 should be HITs.  Without persistence they
-    // would be MISSes (DRAM fetches).
+    // Reset per kernel launch (like cyc_cnt) and printed at the busy falling edge.
     //
-    // CHK_HIT_LAT_MAX separates the two latency modes; the actual latency is
-    // printed per response so the bimodal split is visible.
-    // Filter: grep "CHK_L2"
+    // Verification with -Z (tap = X, which GEMM2 never reads):
+    //   GEMM2 tap_range_reads == 0  -> X persisted in L2 from GEMM1 (persistence OK)
+    //   GEMM2 tap_range_reads  > 0  -> X cold-fetched from DRAM (no persistence)
+    // Filter: grep "DRAM_TAP"
     // -------------------------------------------------------------------------
-    localparam int CHK_HIT_LAT_MAX = 30; // cycles; L2 hit << DRAM miss latency
+    localparam CHK_MEM_LINE_BITS = $clog2(`L2_LINE_SIZE);
 
-    int unsigned chk_req_cyc [longint unsigned]; // tag(row) -> cyc_cnt at request
-    logic [63:0] chk_l2_hits, chk_l2_misses;
-    initial begin
-        chk_l2_hits   = '0;
-        chk_l2_misses = '0;
-    end
-
-    wire chk_rsp_fire = chk_act_bus_if.rsp_valid && chk_act_bus_if.rsp_ready;
-
-    /* verilator lint_off BLKSEQ */
-    /* verilator lint_off WIDTHTRUNC */
-    always @(posedge clk) begin
-        if (chk_req_fire) begin
-            automatic longint unsigned rtag = longint'(chk_act_bus_if.req_data.tag.value);
-            chk_req_cyc[rtag] = cyc_cnt;
+    // Flatten mem_bus_if (interface array needs genvar indexing).
+    wire                      dram_rd_fire [`L2_MEM_PORTS];
+    wire [`MEM_ADDR_WIDTH-1:0] dram_rd_byte [`L2_MEM_PORTS];
+    generate
+        for (genvar mi = 0; mi < `L2_MEM_PORTS; mi++) begin : g_dram_rd_flat
+            assign dram_rd_fire[mi] = mem_bus_if[mi].req_valid
+                                   && mem_bus_if[mi].req_ready
+                                   && !mem_bus_if[mi].req_data.rw;
+            assign dram_rd_byte[mi] =
+                `MEM_ADDR_WIDTH'(mem_bus_if[mi].req_data.addr) << CHK_MEM_LINE_BITS;
         end
-        if (chk_rsp_fire) begin
-            automatic longint unsigned rtag = longint'(chk_act_bus_if.rsp_data.tag.value);
-            if (chk_req_cyc.exists(rtag) != 0) begin
-                automatic int unsigned lat = int'(cyc_cnt) - int'(chk_req_cyc[rtag]);
-                if (lat <= CHK_HIT_LAT_MAX) begin
-                    chk_l2_hits <= chk_l2_hits + 64'd1;
-                    `TRACE(2, ("%t: [CHK_L2_HIT]  tag=%0d  latency=%0d cyc\n",
-                        $time, rtag, lat))
-                end else begin
-                    chk_l2_misses <= chk_l2_misses + 64'd1;
-                    `TRACE(2, ("%t: [CHK_L2_MISS] tag=%0d  latency=%0d cyc\n",
-                        $time, rtag, lat))
-                end
+    endgenerate
+
+    // Tap byte range (same expression as the CONTENTION trace's in_tap).
+    wire [`MEM_ADDR_WIDTH-1:0] tap_lo = checker_hidden_base_addr;
+    wire [`MEM_ADDR_WIDTH-1:0] tap_hi = checker_hidden_base_addr
+        + `MEM_ADDR_WIDTH'(checker_batch_size)
+          * `MEM_ADDR_WIDTH'(checker_hidden_size) * 4;
+
+    // Per-cycle reductions.
+    logic [2:0] tap_rd_fires, all_rd_fires; // max L2_MEM_PORTS
+    always_comb begin
+        tap_rd_fires = '0;
+        all_rd_fires = '0;
+        for (int mi = 0; mi < `L2_MEM_PORTS; mi++) begin
+            if (dram_rd_fire[mi]) begin
+                all_rd_fires = all_rd_fires + 3'd1;
+                if (dram_rd_byte[mi] >= tap_lo && dram_rd_byte[mi] < tap_hi)
+                    tap_rd_fires = tap_rd_fires + 3'd1;
             end
         end
     end
-    /* verilator lint_on WIDTHTRUNC */
-    /* verilator lint_on BLKSEQ */
 
-    // Summary when the checker finishes its run.
+    // Per-kernel counters (reset each vx_start, like cyc_cnt).
+    logic [63:0] dram_rd_tap_cnt, dram_rd_all_cnt;
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            dram_rd_tap_cnt <= '0;
+            dram_rd_all_cnt <= '0;
+        end else begin
+            dram_rd_tap_cnt <= dram_rd_tap_cnt + 64'(tap_rd_fires);
+            dram_rd_all_cnt <= dram_rd_all_cnt + 64'(all_rd_fires);
+        end
+    end
+
     always @(posedge clk) begin
-        if (chk_all_done) begin
-            `TRACE(1, ("%t: [CHK_L2_SUMMARY] hits=%0d  misses=%0d  hit_pct=%0d  (lat_thresh=%0d cyc)\n",
-                $time, chk_l2_hits, chk_l2_misses,
-                ((chk_l2_hits + chk_l2_misses) > 0)
-                    ? (chk_l2_hits * 100 / (chk_l2_hits + chk_l2_misses)) : 0,
-                CHK_HIT_LAT_MAX))
+        if (!reset && busy_prev && !busy) begin
+            `TRACE(1, ("%t: [DRAM_TAP] tap_range_reads=%0d  total_dram_reads=%0d  tap=[0x%0h,0x%0h)\n",
+                $time, dram_rd_tap_cnt, dram_rd_all_cnt, tap_lo, tap_hi))
         end
     end
 
