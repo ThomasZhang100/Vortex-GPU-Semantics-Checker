@@ -77,6 +77,14 @@ static int ENABLE_MODE   = 1;
 // CHECKER_ENABLE the checker port exists in the L2 arbiter but never issues a
 // request.  Isolates structural (port/arbiter-width) overhead from checker activity.
 static bool NO_ARM       = false;
+// -Z: cache-persistence verification (mode 2 only).  Points the checker tap at
+// GEMM1's INPUT matrix X instead of the output A_hidden.  X is read by GEMM1 but
+// NEVER read by GEMM2, so the only way X can be L2-resident when the checker
+// reads it during GEMM2 is if it persisted from GEMM1.  Therefore:
+//   CHK_L2_SUMMARY hit_pct high  -> persistence working
+//   CHK_L2_SUMMARY hit_pct low   -> persistence not working (X cold-fetched)
+// Removes the A_hidden confound where GEMM2's own core reads warm L2 regardless.
+static bool TAP_X        = false;
 
 vx_device_h device       = nullptr;
 vx_buffer_h A_buffer     = nullptr;   // [M x K] FP32 "hidden states" — checker's tap
@@ -109,11 +117,14 @@ static void show_usage() {
     std::cout << "      hardware (and its L2 port) is present but fully idle.  Use with" << std::endl;
     std::cout << "      CHECKER_ENABLE to isolate the arbiter/port structural overhead from" << std::endl;
     std::cout << "      the checker's actual activity." << std::endl;
+    std::cout << "  -Z: cache-persistence verification (mode 2 only) — tap GEMM1's input X" << std::endl;
+    std::cout << "      instead of A_hidden.  X is read by GEMM1 but never by GEMM2, so a" << std::endl;
+    std::cout << "      high CHK_L2 hit rate proves L2 persistence (no GEMM2-warming confound)." << std::endl;
 }
 
 static void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "k:oA:W:C:e:T:F:H:N:t:Xh")) != -1) {
+    while ((c = getopt(argc, argv, "k:oA:W:C:e:T:F:H:N:t:XZh")) != -1) {
         switch (c) {
         case 'k': kernel_file   = optarg;        break;
         case 'o': ones_activation = true;        break;
@@ -122,6 +133,7 @@ static void parse_args(int argc, char** argv) {
         case 'C': thresh_file   = optarg;        break;
         case 'e': ENABLE_MODE   = atoi(optarg);  break;
         case 'X': NO_ARM        = true;          break;
+        case 'Z': TAP_X         = true;          break;
         case 'T': NUM_TOKENS    = atoi(optarg);  break;
         case 'F': NUM_FEATURES  = atoi(optarg);  break;
         case 'H': HIDDEN_SIZE   = atoi(optarg);  break;
@@ -395,16 +407,30 @@ int main(int argc, char* argv[]) {
         uint64_t trig_hi = B_addr + b_size;
         int arm_mode = (ENABLE_MODE == 2) ? 3 : ENABLE_MODE;  // mode 2 uses addr-trigger
 
-        printf("Arming checker: tap=0x%lx  hidden=%d  batch=%d  trig=[0x%lx,0x%lx)  mode=%d%s\n",
-               (unsigned long)A_addr, K, M,
+        // Tap address: normally A_hidden (the monitored hidden states).
+        // Under -Z (mode 2 verification): tap GEMM1's input X instead — X is
+        // read by GEMM1 but never by GEMM2, so checker L2 hits there isolate
+        // the persistence effect from GEMM2's own warming of A.
+        uint64_t tap_addr = A_addr;
+        if (TAP_X) {
+            if (ENABLE_MODE != 2) {
+                fprintf(stderr, "Error: -Z (tap X) is only valid in mode 2 (-e 2)\n");
+                cleanup(); exit(-1);
+            }
+            tap_addr = X_addr;
+        }
+
+        printf("Arming checker: tap=0x%lx%s  hidden=%d  batch=%d  trig=[0x%lx,0x%lx)  mode=%d%s\n",
+               (unsigned long)tap_addr, TAP_X ? " (X: persistence-verify)" : "",
+               K, M,
                (unsigned long)trig_lo, (unsigned long)trig_hi, ENABLE_MODE,
                (ENABLE_MODE == 2) ? " (ENABLE deferred to after GEMM1)" : "");
 
         RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR0,
-                              (uint32_t)(A_addr & 0xFFFFFFFFu)));
+                              (uint32_t)(tap_addr & 0xFFFFFFFFu)));
 #ifdef XLEN_64
         RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TAP_ADDR1,
-                              (uint32_t)(A_addr >> 32)));
+                              (uint32_t)(tap_addr >> 32)));
 #endif
         RT_CHECK(vx_dcr_write(device, VX_DCR_CHECKER_TRIG_ADDR_LO,
                               (uint32_t)(trig_lo & 0xFFFFFFFFu)));
