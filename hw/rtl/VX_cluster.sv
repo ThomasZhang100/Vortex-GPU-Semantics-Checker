@@ -709,13 +709,14 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     // Flatten mem_bus_if (interface array needs genvar indexing).
     wire                      dram_rd_fire [`L2_MEM_PORTS];
-    wire [`MEM_ADDR_WIDTH-1:0] dram_rd_byte [`L2_MEM_PORTS];
+    wire                      dram_wr_fire [`L2_MEM_PORTS];
+    wire [`MEM_ADDR_WIDTH-1:0] dram_byte    [`L2_MEM_PORTS];
     generate
-        for (genvar mi = 0; mi < `L2_MEM_PORTS; mi++) begin : g_dram_rd_flat
-            assign dram_rd_fire[mi] = mem_bus_if[mi].req_valid
-                                   && mem_bus_if[mi].req_ready
-                                   && !mem_bus_if[mi].req_data.rw;
-            assign dram_rd_byte[mi] =
+        for (genvar mi = 0; mi < `L2_MEM_PORTS; mi++) begin : g_dram_flat
+            wire fire = mem_bus_if[mi].req_valid && mem_bus_if[mi].req_ready;
+            assign dram_rd_fire[mi] = fire && !mem_bus_if[mi].req_data.rw;
+            assign dram_wr_fire[mi] = fire &&  mem_bus_if[mi].req_data.rw;
+            assign dram_byte[mi] =
                 `MEM_ADDR_WIDTH'(mem_bus_if[mi].req_data.addr) << CHK_MEM_LINE_BITS;
         end
     endgenerate
@@ -726,36 +727,42 @@ module VX_cluster import VX_gpu_pkg::*; #(
         + `MEM_ADDR_WIDTH'(checker_batch_size)
           * `MEM_ADDR_WIDTH'(checker_hidden_size) * 4;
 
-    // Per-cycle reductions.
-    logic [2:0] tap_rd_fires, all_rd_fires; // max L2_MEM_PORTS
+    // Per-cycle reductions: reads/writes in tap range, plus all reads.
+    logic [2:0] tap_rd_fires, tap_wr_fires, all_rd_fires;
     always_comb begin
         tap_rd_fires = '0;
+        tap_wr_fires = '0;
         all_rd_fires = '0;
         for (int mi = 0; mi < `L2_MEM_PORTS; mi++) begin
+            automatic logic in_tap =
+                (dram_byte[mi] >= tap_lo) && (dram_byte[mi] < tap_hi);
             if (dram_rd_fire[mi]) begin
                 all_rd_fires = all_rd_fires + 3'd1;
-                if (dram_rd_byte[mi] >= tap_lo && dram_rd_byte[mi] < tap_hi)
-                    tap_rd_fires = tap_rd_fires + 3'd1;
+                if (in_tap) tap_rd_fires = tap_rd_fires + 3'd1;
             end
+            if (dram_wr_fire[mi] && in_tap)
+                tap_wr_fires = tap_wr_fires + 3'd1;
         end
     end
 
     // Per-kernel counters (reset each vx_start, like cyc_cnt).
-    logic [63:0] dram_rd_tap_cnt, dram_rd_all_cnt;
+    logic [63:0] dram_rd_tap_cnt, dram_wr_tap_cnt, dram_rd_all_cnt;
     always_ff @(posedge clk) begin
         if (reset) begin
             dram_rd_tap_cnt <= '0;
+            dram_wr_tap_cnt <= '0;
             dram_rd_all_cnt <= '0;
         end else begin
             dram_rd_tap_cnt <= dram_rd_tap_cnt + 64'(tap_rd_fires);
+            dram_wr_tap_cnt <= dram_wr_tap_cnt + 64'(tap_wr_fires);
             dram_rd_all_cnt <= dram_rd_all_cnt + 64'(all_rd_fires);
         end
     end
 
     always @(posedge clk) begin
         if (!reset && busy_prev && !busy) begin
-            `TRACE(1, ("%t: [DRAM_TAP] tap_range_reads=%0d  total_dram_reads=%0d  tap=[0x%0h,0x%0h)\n",
-                $time, dram_rd_tap_cnt, dram_rd_all_cnt, tap_lo, tap_hi))
+            `TRACE(1, ("%t: [DRAM_TAP] tap_reads=%0d  tap_writebacks=%0d  total_dram_reads=%0d  tap=[0x%0h,0x%0h)\n",
+                $time, dram_rd_tap_cnt, dram_wr_tap_cnt, dram_rd_all_cnt, tap_lo, tap_hi))
         end
     end
 

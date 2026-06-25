@@ -65,6 +65,13 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
     reg cold_done;
     initial cold_done = 1'b0;
     wire do_cold_init = !cold_done;
+
+`ifdef SIMULATION
+    // Track reset edge so the diagnostic trace fires once per launch.
+    reg reset_d;
+    initial reset_d = 1'b0;
+    always @(posedge clk) reset_d <= reset;
+`endif
 `else
     wire do_cold_init = 1'b1;
 `endif
@@ -120,10 +127,9 @@ module VX_cache_flush import VX_gpu_pkg::*; #(
             counter <= '0;
 `ifdef CACHE_PERSIST
 `ifdef SIMULATION
-            // Diagnostic: fires on the FIRST reset cycle of each launch (state was
-            // not already IDLE-from-reset).  do_cold_init=1 -> clearing cache;
-            // do_cold_init=0 -> preserving cache (persistence engaged).
-            if (BANK_ID == 0 && state != STATE_INIT)
+            // Diagnostic: fire ONCE on the rising edge of reset (reset_d=0).
+            // do_cold_init=1 -> clearing cache; 0 -> preserving (persistence on).
+            if (BANK_ID == 0 && !reset_d)
                 `TRACE(1, ("%t: [CACHE_PERSIST] cache_size=%0d reset: do_cold_init=%0b (%s)\n",
                     $time, CACHE_SIZE, do_cold_init,
                     do_cold_init ? "CLEARING cache" : "PRESERVING cache"))
