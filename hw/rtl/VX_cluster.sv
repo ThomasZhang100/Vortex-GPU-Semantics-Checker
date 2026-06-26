@@ -235,28 +235,28 @@ module VX_cluster import VX_gpu_pkg::*; #(
             if (mem_port_fire[mp]) l2_fires++;
     end
 
-    // Counters are NOT reset between kernel launches (no `if (reset)` clause).
-    // Between mode-2 GEMMs the processor issues a reset pulse; clearing counters
-    // there would lose GEMM1 data.  Instead they accumulate from power-on and we
-    // print on every falling edge of busy so the user sees both per-GEMM and
-    // cumulative numbers.
-    // initial (not reset) so they start at 0 yet survive the inter-kernel reset
-    // pulse, accumulating across both mode-2 GEMMs.  No reset clause: a reset
-    // here would zero the counts between GEMMs.
+    // Per-kernel counters: cleared on each vx_start reset pulse (same pattern as
+    // cyc_cnt below), so the print at each busy falling edge reports only that
+    // kernel's misses.  In mode 2 the two GEMMs each get their own reset, so GEMM1
+    // and GEMM2 print independent counts rather than a running cumulative total.
     logic [63:0] l1_miss_cnt, l2_miss_cnt;
     initial begin
         l1_miss_cnt = '0;
         l2_miss_cnt = '0;
     end
     always_ff @(posedge clk) begin
-        l1_miss_cnt <= l1_miss_cnt + 64'(l1_fires);
-        l2_miss_cnt <= l2_miss_cnt + 64'(l2_fires);
+        if (reset) begin
+            l1_miss_cnt <= '0;
+            l2_miss_cnt <= '0;
+        end else begin
+            l1_miss_cnt <= l1_miss_cnt + 64'(l1_fires);
+            l2_miss_cnt <= l2_miss_cnt + 64'(l2_fires);
+        end
     end
 
     // Print on every falling edge of busy (once per vx_start/vx_ready_wait pair).
     // Mode 1/3: one print at kernel end.
-    // Mode 2: two prints — one after GEMM1, one after GEMM2.
-    // The LAST print before PERF contains the cumulative miss counts.
+    // Mode 2: two prints — GEMM1 then GEMM2, each showing that kernel's own counts.
     // initial=0 avoids a spurious X-driven edge at time 0.
     logic busy_prev;
     initial busy_prev = 1'b0;
@@ -309,15 +309,21 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // hit (no miss pulse), so it is never mis-attributed.
     //
     // When CHECKER_ENABLE is off, L2_CHK_SRC=-1 so chk is always 0 and core counts
-    // every L2 miss.  Counters accumulate across mode-2 GEMMs (initial, no reset).
+    // every L2 miss.  Per-kernel: cleared on each vx_start reset pulse (like the
+    // l1/l2 counters above), so each busy-falling-edge print is that kernel only.
     logic [63:0] core_l2_miss_cnt, chk_l2_miss_cnt;
     initial begin
         core_l2_miss_cnt = '0;
         chk_l2_miss_cnt  = '0;
     end
     always_ff @(posedge clk) begin
-        core_l2_miss_cnt <= core_l2_miss_cnt + 64'(l2_core_miss_inc);
-        chk_l2_miss_cnt  <= chk_l2_miss_cnt  + 64'(l2_chk_miss_inc);
+        if (reset) begin
+            core_l2_miss_cnt <= '0;
+            chk_l2_miss_cnt  <= '0;
+        end else begin
+            core_l2_miss_cnt <= core_l2_miss_cnt + 64'(l2_core_miss_inc);
+            chk_l2_miss_cnt  <= chk_l2_miss_cnt  + 64'(l2_chk_miss_inc);
+        end
     end
 
     // l2_dram_reads is the actual DRAM-read count at the L2 mem port (ground truth).
