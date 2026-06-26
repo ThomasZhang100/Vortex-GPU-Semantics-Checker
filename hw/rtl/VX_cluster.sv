@@ -94,6 +94,20 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     `RESET_RELAY (l2_reset, reset);
 
+    // Source-resolved L2 miss tracking (SIMULATION-only).  The checker shares the
+    // L2 through a dedicated input port at index L2_NUM_REQS-1; passing that index
+    // as CHK_SRC lets the L2 bank tag each DRAM-read-causing miss with its true
+    // origin (core vs checker) at the point hit/miss is actually determined.
+`ifdef CHECKER_ENABLE
+    localparam L2_CHK_SRC = L2_NUM_REQS - 1;
+`else
+    localparam L2_CHK_SRC = -1;
+`endif
+`ifdef SIMULATION
+    wire [`CLOG2(`L2_NUM_BANKS+1)-1:0] l2_core_miss_inc; // core misses this cycle
+    wire [`CLOG2(`L2_NUM_BANKS+1)-1:0] l2_chk_miss_inc;  // checker misses this cycle
+`endif
+
     VX_cache_wrap #(
         .INSTANCE_ID    (`SFORMATF(("%s-l2cache", INSTANCE_ID))),
         .CACHE_SIZE     (`L2_CACHE_SIZE),
@@ -111,6 +125,7 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .WRITE_ENABLE   (1),
         .WRITEBACK      (`L2_WRITEBACK),
         .DIRTY_BYTES    (`L2_DIRTYBYTES),
+        .CHK_SRC        (L2_CHK_SRC),
         .REPL_POLICY    (`L2_REPL_POLICY),
         .CORE_OUT_BUF   (3),
         .MEM_OUT_BUF    (3),
@@ -121,6 +136,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .reset          (l2_reset),
     `ifdef PERF_ENABLE
         .cache_perf     (l2_perf),
+    `endif
+    `ifdef SIMULATION
+        .perf_core_miss (l2_core_miss_inc),
+        .perf_chk_miss  (l2_chk_miss_inc),
     `endif
         .core_bus_if    (l2_core_bus_if),
         .mem_bus_if     (mem_bus_if)
@@ -274,40 +293,34 @@ module VX_cluster import VX_gpu_pkg::*; #(
         end
     end
 
-    // core_l2_miss_cnt: l2_miss_cnt minus checker-caused DRAM fetches.
-    // With CHECKER_ENABLE the checker's cold misses are subtracted out below;
-    // without it every DRAM fetch came from a core, so no adjustment needed.
-`ifdef CHECKER_ENABLE
-    // Count first-time checker L2 fetches (= checker cold misses = DRAM fetches
-    // caused by the checker).  Repeat accesses to the same line are L2 hits.
-    logic [63:0] chk_l2_miss_cnt;
-    int unsigned chk_seen_addrs [longint unsigned];
-    initial chk_l2_miss_cnt = '0;
-
-    /* verilator lint_off BLKSEQ */
-    /* verilator lint_off WIDTHTRUNC */
-    always @(posedge clk) begin
-        if (chk_req_fire) begin
-            automatic longint unsigned addr = longint'(chk_act_bus_if.req_data.addr);
-            if (chk_seen_addrs.exists(addr) == 0) begin
-                chk_seen_addrs[addr] = 1;
-                chk_l2_miss_cnt <= chk_l2_miss_cnt + 64'd1;
-            end
-        end
+    // Source-resolved L2 miss counts, taken DIRECTLY from the L2 bank.
+    //
+    // l2_core_miss_inc / l2_chk_miss_inc are this-cycle counts of DRAM-read-causing
+    // misses, classified inside the bank by the missing request's originating input
+    // port (req_idx == checker port => checker, else core).  This is the actual
+    // hit/miss decision at the actual miss point — no address residency model, no
+    // subtraction.  A checker request that hits a core-loaded line is correctly a
+    // hit (no miss pulse), so it is never mis-attributed.
+    //
+    // When CHECKER_ENABLE is off, L2_CHK_SRC=-1 so chk is always 0 and core counts
+    // every L2 miss.  Counters accumulate across mode-2 GEMMs (initial, no reset).
+    logic [63:0] core_l2_miss_cnt, chk_l2_miss_cnt;
+    initial begin
+        core_l2_miss_cnt = '0;
+        chk_l2_miss_cnt  = '0;
     end
-    /* verilator lint_on WIDTHTRUNC */
-    /* verilator lint_on BLKSEQ */
+    always_ff @(posedge clk) begin
+        core_l2_miss_cnt <= core_l2_miss_cnt + 64'(l2_core_miss_inc);
+        chk_l2_miss_cnt  <= chk_l2_miss_cnt  + 64'(l2_chk_miss_inc);
+    end
 
-    wire [63:0] core_l2_miss_cnt = l2_miss_cnt - chk_l2_miss_cnt;
-`else
-    wire [63:0] core_l2_miss_cnt = l2_miss_cnt;
-    wire [63:0] chk_l2_miss_cnt  = '0;
-`endif
-
+    // l2_dram_reads is the actual DRAM-read count at the L2 mem port (ground truth).
+    // It must equal core + chk: a cross-check that the bank-level attribution is
+    // complete (every DRAM-read-causing miss was tagged to exactly one source).
     always @(posedge clk) begin
         if (!reset && busy_prev && !busy) begin
-            `TRACE(1, ("%t: [MISS_RATE] l1_misses=%0d  l2_misses_core=%0d  l2_misses_chk=%0d  l2_miss_pct=%0d\n",
-                $time, l1_miss_cnt, core_l2_miss_cnt, chk_l2_miss_cnt,
+            `TRACE(1, ("%t: [MISS_RATE] l1_misses=%0d  l2_misses_core=%0d  l2_misses_chk=%0d  l2_dram_reads=%0d  l2_miss_pct=%0d\n",
+                $time, l1_miss_cnt, core_l2_miss_cnt, chk_l2_miss_cnt, l2_miss_cnt,
                 (l1_miss_cnt > 0) ? (core_l2_miss_cnt * 100 / l1_miss_cnt) : 0))
         end
     end

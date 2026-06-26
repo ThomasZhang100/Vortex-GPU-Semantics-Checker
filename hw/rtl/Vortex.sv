@@ -102,6 +102,12 @@ module Vortex import VX_gpu_pkg::*; (
         .cache_perf     (l3_perf),
     `endif
 
+    `ifdef SIMULATION
+        // Source-resolved miss instrumentation unused at L3 (no checker port here).
+        `UNUSED_PIN (perf_core_miss),
+        `UNUSED_PIN (perf_chk_miss),
+    `endif
+
         .core_bus_if    (per_cluster_mem_bus_if),
         .mem_bus_if     (mem_bus_if)
     );

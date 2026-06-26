@@ -53,6 +53,10 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
     // Enable dirty bytes on writeback
     parameter DIRTY_BYTES           = 0,
 
+    // Source-resolved miss tracking: input-port index counted as "checker"
+    // misses (SIMULATION-only instrumentation).  -1 disables.
+    parameter CHK_SRC               = -1,
+
     // Replacement policy
     parameter REPL_POLICY           = `CS_REPL_FIFO,
 
@@ -78,6 +82,12 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
     // PERF
 `ifdef PERF_ENABLE
     output cache_perf_t     cache_perf,
+`endif
+
+`ifdef SIMULATION
+    // Source-resolved L2 miss counts this cycle (SIMULATION-only instrumentation).
+    output wire [`CLOG2(NUM_BANKS+1)-1:0] perf_core_miss,
+    output wire [`CLOG2(NUM_BANKS+1)-1:0] perf_chk_miss,
 `endif
 
     VX_mem_bus_if.slave     core_bus_if [NUM_REQS],
@@ -171,6 +181,7 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
             .WRITE_ENABLE (WRITE_ENABLE),
             .WRITEBACK    (WRITEBACK),
             .DIRTY_BYTES  (DIRTY_BYTES),
+            .CHK_SRC      (CHK_SRC),
             .REPL_POLICY  (REPL_POLICY),
             .CRSQ_SIZE    (CRSQ_SIZE),
             .MSHR_SIZE    (MSHR_SIZE),
@@ -185,6 +196,10 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
         `ifdef PERF_ENABLE
             .cache_perf     (cache_perf),
         `endif
+        `ifdef SIMULATION
+            .perf_core_miss (perf_core_miss),
+            .perf_chk_miss  (perf_chk_miss),
+        `endif
             .core_bus_if    (core_bus_cache_if),
             .mem_bus_if     (mem_bus_cache_if)
         );
@@ -198,6 +213,12 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
         for (genvar i = 0; i < MEM_PORTS; ++i) begin : g_mem_bus_cache_if
             `INIT_VX_MEM_BUS_IF (mem_bus_cache_if[i])
         end
+
+    `ifdef SIMULATION
+        // No cache instantiated in passthrough mode: no L2 misses to classify.
+        assign perf_core_miss = '0;
+        assign perf_chk_miss  = '0;
+    `endif
 
     `ifdef PERF_ENABLE
         wire [NUM_REQS-1:0]  perf_core_reads_per_req;

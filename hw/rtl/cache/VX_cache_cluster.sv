@@ -171,6 +171,11 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
         `ifdef PERF_ENABLE
             .cache_perf  (perf_cache_unit[i]),
         `endif
+        `ifdef SIMULATION
+            // Source-resolved miss instrumentation unused here (no checker port).
+            `UNUSED_PIN (perf_core_miss),
+            `UNUSED_PIN (perf_chk_miss),
+        `endif
             .clk         (clk),
             .reset       (reset),
             .core_bus_if (arb_core_bus_if[i * NUM_REQS +: NUM_REQS]),

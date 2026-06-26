@@ -51,6 +51,10 @@ module VX_cache import VX_gpu_pkg::*; #(
     // Enable dirty bytes on writeback
     parameter DIRTY_BYTES           = 0,
 
+    // Source-resolved miss tracking: input-port index counted as "checker"
+    // misses (SIMULATION-only instrumentation).  -1 disables.
+    parameter CHK_SRC               = -1,
+
     // Replacement policy
     parameter REPL_POLICY           = `CS_REPL_FIFO,
 
@@ -66,6 +70,13 @@ module VX_cache import VX_gpu_pkg::*; #(
     // PERF
 `ifdef PERF_ENABLE
     output cache_perf_t     cache_perf,
+`endif
+
+`ifdef SIMULATION
+    // Source-resolved L2 miss counts this cycle (SIMULATION-only instrumentation):
+    // number of DRAM-read-causing misses, split by origin (see CHK_SRC).
+    output wire [`CLOG2(NUM_BANKS+1)-1:0] perf_core_miss,
+    output wire [`CLOG2(NUM_BANKS+1)-1:0] perf_chk_miss,
 `endif
 
     input wire clk,
@@ -108,6 +119,12 @@ module VX_cache import VX_gpu_pkg::*; #(
     wire [NUM_BANKS-1:0] perf_read_miss_per_bank;
     wire [NUM_BANKS-1:0] perf_write_miss_per_bank;
     wire [NUM_BANKS-1:0] perf_mshr_stall_per_bank;
+`endif
+
+`ifdef SIMULATION
+    // Source-resolved miss pulses, one per bank (SIMULATION-only instrumentation).
+    wire [NUM_BANKS-1:0] perf_core_miss_per_bank;
+    wire [NUM_BANKS-1:0] perf_chk_miss_per_bank;
 `endif
 
     VX_mem_bus_if #(
@@ -372,6 +389,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             .WRITE_ENABLE (WRITE_ENABLE),
             .WRITEBACK    (WRITEBACK),
             .DIRTY_BYTES  (DIRTY_BYTES),
+            .CHK_SRC      (CHK_SRC),
             .REPL_POLICY  (REPL_POLICY),
             .CRSQ_SIZE    (CRSQ_SIZE),
             .MSHR_SIZE    (MSHR_SIZE),
@@ -387,6 +405,11 @@ module VX_cache import VX_gpu_pkg::*; #(
             .perf_read_miss    (perf_read_miss_per_bank[bank_id]),
             .perf_write_miss   (perf_write_miss_per_bank[bank_id]),
             .perf_mshr_stall   (perf_mshr_stall_per_bank[bank_id]),
+        `endif
+
+        `ifdef SIMULATION
+            .perf_core_miss    (perf_core_miss_per_bank[bank_id]),
+            .perf_chk_miss     (perf_chk_miss_per_bank[bank_id]),
         `endif
 
             // Core request
@@ -430,6 +453,12 @@ module VX_cache import VX_gpu_pkg::*; #(
             .flush_end          (per_bank_flush_end[bank_id])
         );
     end
+
+`ifdef SIMULATION
+    // Aggregate per-bank source-resolved miss pulses into this-cycle counts.
+    `POP_COUNT(perf_core_miss, perf_core_miss_per_bank);
+    `POP_COUNT(perf_chk_miss,  perf_chk_miss_per_bank);
+`endif
 
     // Core responses gather //////////////////////////////////////////////////
 

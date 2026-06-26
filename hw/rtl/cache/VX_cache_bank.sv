@@ -47,6 +47,13 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // Enable dirty bytes on writeback
     parameter DIRTY_BYTES       = 0,
 
+    // Source-resolved miss tracking (SIMULATION instrumentation).
+    // CHK_SRC = the core-request input-port index whose misses should be counted
+    // as "checker" misses instead of "core" misses.  -1 disables (all misses are
+    // core misses).  The checker shares the L2 via a dedicated input port, so its
+    // index (L2_NUM_REQS-1) is passed here to split L2 misses by true origin.
+    parameter CHK_SRC           = -1,
+
     // Replacement policy
     parameter REPL_POLICY       = `CS_REPL_FIFO,
 
@@ -71,6 +78,15 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     output wire perf_read_miss,
     output wire perf_write_miss,
     output wire perf_mshr_stall,
+`endif
+
+`ifdef SIMULATION
+    // Source-resolved miss pulses (1-cycle, one per DRAM-read-causing miss).
+    // SIMULATION-only instrumentation — no synthesizable hardware is generated.
+    // perf_chk_miss : the missing request came from input port CHK_SRC.
+    // perf_core_miss: any other source.  Both are 0 when CHK_SRC < 0.
+    output wire                         perf_core_miss,
+    output wire                         perf_chk_miss,
 `endif
 
     // Core Request
@@ -682,6 +698,21 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     assign perf_read_miss  = do_read_st1 && ~is_hit_st1;
     assign perf_write_miss = do_write_st1 && ~is_hit_st1;
     assign perf_mshr_stall = mshr_alm_full;
+`endif
+
+`ifdef SIMULATION
+    // Source-resolved L2 miss classification (SIMULATION-only instrumentation).
+    // A DRAM-read-causing miss is a core lookup that missed and is not already
+    // pending in the MSHR (same condition as the writeback fill-issue path), so
+    // each pulse maps 1:1 to a real DRAM read.  req_idx_st1 carries the
+    // originating input-port index (the core_req_xbar select used for response
+    // routing), so comparing it to CHK_SRC splits checker vs core misses exactly.
+    wire src_miss_evt = (do_read_st1 || do_write_st1)
+                     && ~is_hit_st1 && ~mshr_pending_st1 && ~pipe_stall;
+    wire src_is_chk   = (CHK_SRC >= 0)
+                     && (req_idx_st1 == REQ_SEL_WIDTH'(CHK_SRC));
+    assign perf_chk_miss  = src_miss_evt &&  src_is_chk;
+    assign perf_core_miss = src_miss_evt && ~src_is_chk;
 `endif
 
 `ifdef DBG_TRACE_CACHE
