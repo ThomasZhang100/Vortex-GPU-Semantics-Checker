@@ -163,7 +163,8 @@ void cleanup() {
 // File format (written by run_tests.py write_weight_bin):
 //   [HIDDEN_SIZE × VX_CHECKER_MAX_FEATURES] FP16 values, row-major, little-endian.
 // Each SRAM row is VX_CHECKER_MAX_FEATURES FP16 = VX_CHECKER_MAX_FEATURES/2 uint32 words.
-// VX_cluster.sv assembles 32 words into a 1024-bit buffer then pulses the SRAM write.
+// VX_cluster.sv assembles those words (VX_CHECKER_MAX_FEATURES*16 bits = one row)
+// into the weight buffer then pulses the SRAM write.
 static void load_checker_weights(vx_device_h dev, const char* path, int hidden_size) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { fprintf(stderr, "Error: cannot open weight file '%s'\n", path); cleanup(); exit(-1); }

@@ -45,7 +45,7 @@
 
 // Checker compile-time geometry — must match VX_checker.sv parameter defaults.
 // Exposed here so the host driver (main.cpp, vx_dcr_write) can compute buffer sizes.
-`define VX_CHECKER_MAX_FEATURES         64       // SRAM columns (FP16 values per row)
+`define VX_CHECKER_MAX_FEATURES         256      // SRAM columns (FP16 values per row)
 `define VX_CHECKER_MAX_HIDDEN           2048     // SRAM depth (rows)
 
 `define VX_DCR_BASE_STATE(addr)         ((addr) - `VX_DCR_BASE_STATE_BEGIN)

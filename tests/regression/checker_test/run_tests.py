@@ -42,7 +42,7 @@ BLACKBOX   = BUILD_DIR / "ci" / "blackbox.sh"
 
 # Must match the compiled RTL parameter VX_checker MAX_FEATURES.
 # Each SRAM row is MAX_FEATURES FP16 values wide; $readmemh reads one row per line.
-MAX_FEATURES = 64
+MAX_FEATURES = 256
 
 
 # ---------------------------------------------------------------------------

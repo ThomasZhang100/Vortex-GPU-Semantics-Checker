@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-MAX_FEATURES = 64   # must match VX_checker.sv MAX_FEATURES
+MAX_FEATURES = 256   # must match VX_checker.sv MAX_FEATURES
 TEST_DIR = Path(__file__).parent
 
 
@@ -139,7 +139,7 @@ def main() -> None:
     p.add_argument("--hidden",    "-H", type=int, default=64,
                    help="hidden size K = inner dim = output dim of GEMM1 (default 64)")
     p.add_argument("--features",  "-F", type=int, default=32,
-                   help="number of SAE features (<= MAX_FEATURES=64, default 32)")
+                   help="number of SAE features (<= MAX_FEATURES=256, default 32)")
     p.add_argument("--count-k",   "-k", type=int, default=16,
                    help="count-k threshold (default 16)")
     p.add_argument("--seed",      "-s", type=int, default=0,

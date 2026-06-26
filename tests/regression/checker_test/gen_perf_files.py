@@ -11,7 +11,7 @@ Outputs (in the same directory as this script):
 
 These are passed to the checker_test binary via -W and -C flags.
 Weights and thresholds are random but fixed-seed so results are reproducible.
-MAX_FEATURES=64 is the RTL compile-time constant (VX_checker MAX_FEATURES param).
+MAX_FEATURES=256 is the RTL compile-time constant (VX_checker MAX_FEATURES param).
 """
 
 import argparse
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-MAX_FEATURES = 64   # must match VX_checker.sv MAX_FEATURES parameter
+MAX_FEATURES = 256   # must match VX_checker.sv MAX_FEATURES parameter
 TEST_DIR     = Path(__file__).parent
 
 
@@ -84,7 +84,7 @@ def main() -> None:
     p.add_argument("--hidden",    "-H", type=int, default=512,
                    help="hidden_size (rows of weight SRAM, == -H in checker_test)")
     p.add_argument("--features",  "-F", type=int, default=64,
-                   help="num_features (<= MAX_FEATURES=64)")
+                   help="num_features (<= MAX_FEATURES=256)")
     p.add_argument("--count-k",   "-k", type=int, default=32,
                    help="count threshold k (flag fires when fired_count > k)")
     p.add_argument("--seed",      "-s", type=int, default=0,

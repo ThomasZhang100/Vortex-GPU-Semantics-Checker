@@ -351,15 +351,16 @@ module VX_cluster import VX_gpu_pkg::*; #(
     logic [`MEM_ADDR_WIDTH-1:0]  checker_trigger_lo;     // trigger range low  (inclusive)
     logic [`MEM_ADDR_WIDTH-1:0]  checker_trigger_hi;     // trigger range high (exclusive)
 
-    // Weight SRAM streaming state — must match VX_checker parameter defaults.
-    localparam CHK_MAX_FEAT  = 64;
-    localparam CHK_MAX_HIDN  = 2048;
-    localparam CHK_W_DATAW   = CHK_MAX_FEAT * 16;      // 1024 bits per SRAM row
+    // Weight SRAM streaming state — sized from the shared VX_CHECKER_MAX_FEATURES
+    // macro (VX_types.vh) and passed to VX_checker below so they cannot drift.
+    localparam CHK_MAX_FEAT  = `VX_CHECKER_MAX_FEATURES;
+    localparam CHK_MAX_HIDN  = `VX_CHECKER_MAX_HIDDEN;
+    localparam CHK_W_DATAW   = CHK_MAX_FEAT * 16;      // bits per SRAM row (256*16=4096)
     localparam CHK_W_ADDRW   = $clog2(CHK_MAX_HIDN);   // 11
-    localparam CHK_W_WORDS   = CHK_W_DATAW / 32;        // 32 uint32 words per row
-    localparam CHK_W_WORD_W  = $clog2(CHK_W_WORDS);     // 5
-    localparam CHK_T_CNT     = CHK_MAX_FEAT + 1;        // threshold[0..64]
-    localparam CHK_T_IDX_W   = $clog2(CHK_T_CNT + 1);  // 7
+    localparam CHK_W_WORDS   = CHK_W_DATAW / 32;        // uint32 words per row (4096/32=128)
+    localparam CHK_W_WORD_W  = $clog2(CHK_W_WORDS);     // 7
+    localparam CHK_T_CNT     = CHK_MAX_FEAT + 1;        // threshold[0..MAX_FEAT]
+    localparam CHK_T_IDX_W   = $clog2(CHK_T_CNT + 1);  // 9
 
     logic [CHK_W_ADDRW-1:0]  w_wrow;   // next SRAM row to write
     logic [CHK_W_WORD_W-1:0] w_wcol;   // word position within the row (0..CHK_W_WORDS-1)
@@ -549,7 +550,10 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     wire [15:0] checker_flag;
     wire        chk_all_done;
-    VX_checker sem_checker (
+    VX_checker #(
+        .MAX_FEATURES (CHK_MAX_FEAT),
+        .MAX_HIDDEN   (CHK_MAX_HIDN)
+    ) sem_checker (
         .clk              (clk),
         .reset            (reset),
         .checker_armed    (checker_armed),
