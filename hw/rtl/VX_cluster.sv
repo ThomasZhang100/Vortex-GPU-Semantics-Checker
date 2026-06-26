@@ -190,7 +190,9 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // Global cache miss-rate counters.
     //
     // l1_miss_cnt : total L2 requests from core sockets (one per L1 cache miss).
-    // l2_miss_cnt : total DRAM requests from L2       (one per L2 cache miss).
+    // l2_miss_cnt : DRAM READ requests from L2 (fills) — one per L2 read miss.
+    //               Writebacks (DRAM writes) are excluded so this equals the
+    //               total fill count, i.e. core+chk source-resolved misses.
     // L2 miss rate = l2_miss_cnt / l1_miss_cnt
     //
     // Printed when busy falls (all warps have retired).
@@ -209,11 +211,15 @@ module VX_cluster import VX_gpu_pkg::*; #(
         end
     endgenerate
 
+    // Count only DRAM READ requests (fills) — i.e. true L2 misses.  Writebacks
+    // (rw=1) are dirty-line evictions/flushes, not misses, so they are excluded;
+    // counting them here is what previously made l2_dram_reads exceed core+chk.
     logic mem_port_fire [`L2_MEM_PORTS];
     generate
         for (genvar mp = 0; mp < `L2_MEM_PORTS; ++mp) begin : g_mem_port_fire
             assign mem_port_fire[mp] = mem_bus_if[mp].req_valid
-                                    && mem_bus_if[mp].req_ready;
+                                    && mem_bus_if[mp].req_ready
+                                    && !mem_bus_if[mp].req_data.rw;
         end
     endgenerate
 
