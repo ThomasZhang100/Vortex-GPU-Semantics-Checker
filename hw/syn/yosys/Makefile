@@ -50,13 +50,25 @@ endif
 RTL_INCLUDE = -I$(RTL_DIR) -I$(RTL_DIR)/libs -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/cache
 RTL_INCLUDE += $(FPU_INCLUDE)
 
-# Checker (SAURIA systolic array): add sauria + its cvfpu (pulp_fma) search paths.
-# Mirrors sim/rtlsim/Makefile so gen_sources/sv2v can locate sa_array and friends.
+# Checker (SAURIA systolic array): add sauria dirs so gen_sources copies sa_array,
+# sa_processing_element, the FMA wrapper, and the adder/multiplier modules into src/.
+# The cvfpu helper files the FMA needs are handled separately (CHK_CVFPU_SRCS below):
+# they can't go through gen_sources' whole-dir copy because cvfpu/src/fpnew_fma.sv
+# would collide with sauria's own pulp_fma/fpnew_fma.sv.  The -J common_cells/include
+# is still required so gen_sources can resolve `include "common_cells/registers.svh"`
+# while preprocessing fpnew_fma.sv.
 ifneq (,$(findstring -DCHECKER_ENABLE, $(CONFIGS)))
 	RTL_INCLUDE += -I$(RTL_DIR)/core/sauria -I$(RTL_DIR)/core/sauria/multiplier -I$(RTL_DIR)/core/sauria/adder -I$(RTL_DIR)/core/sauria/pulp_fma
-	ifeq (,$(findstring -DFPU_FPNEW, $(CONFIGS)))
-		RTL_INCLUDE += -J$(THIRD_PARTY_DIR)/cvfpu/src -J$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -J$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src
-	endif
+	RTL_INCLUDE += -J$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include
+	# cvfpu packages/helpers the FMA references — passed to sv2v as explicit sources
+	# (none of them have their own `include, so no extra incdirs are needed).
+	CHK_CVFPU_SRCS := \
+		$(THIRD_PARTY_DIR)/cvfpu/src/fpnew_pkg.sv \
+		$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src/cf_math_pkg.sv \
+		$(THIRD_PARTY_DIR)/cvfpu/src/fpnew_classifier.sv \
+		$(THIRD_PARTY_DIR)/cvfpu/src/fpnew_rounding.sv \
+		$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src/lzc.sv
+	SV2V_EXTRA := -s "$(CHK_CVFPU_SRCS)"
 endif
 
 # Debugging
@@ -91,7 +103,7 @@ $(BUILD_DIR)/sources.txt:
 
 sv2v: $(BUILD_DIR)/project.v
 $(BUILD_DIR)/project.v: gen-sources
-	cd $(BUILD_DIR); $(SCRIPT_DIR)/sv2v.sh -t$(TOP_LEVEL_ENTITY) -Isrc -oproject.v
+	cd $(BUILD_DIR); $(SCRIPT_DIR)/sv2v.sh -t$(TOP_LEVEL_ENTITY) -Isrc $(SV2V_EXTRA) -oproject.v
 
 build: $(BUILD_DIR)/project.v
 	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v
