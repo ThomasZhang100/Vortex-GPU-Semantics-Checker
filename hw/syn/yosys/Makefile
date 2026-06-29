@@ -50,6 +50,15 @@ endif
 RTL_INCLUDE = -I$(RTL_DIR) -I$(RTL_DIR)/libs -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/cache
 RTL_INCLUDE += $(FPU_INCLUDE)
 
+# Checker (SAURIA systolic array): add sauria + its cvfpu (pulp_fma) search paths.
+# Mirrors sim/rtlsim/Makefile so gen_sources/sv2v can locate sa_array and friends.
+ifneq (,$(findstring -DCHECKER_ENABLE, $(CONFIGS)))
+	RTL_INCLUDE += -I$(RTL_DIR)/core/sauria -I$(RTL_DIR)/core/sauria/multiplier -I$(RTL_DIR)/core/sauria/adder -I$(RTL_DIR)/core/sauria/pulp_fma
+	ifeq (,$(findstring -DFPU_FPNEW, $(CONFIGS)))
+		RTL_INCLUDE += -J$(THIRD_PARTY_DIR)/cvfpu/src -J$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -J$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src
+	endif
+endif
+
 # Debugging
 ifdef DEBUG
 	CFLAGS += $(DBG_TRACE_FLAGS)
