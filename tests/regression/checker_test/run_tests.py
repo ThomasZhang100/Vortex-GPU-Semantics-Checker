@@ -107,13 +107,15 @@ def reference_flags(fired: np.ndarray, count_k: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def write_weight_hex(weights: np.ndarray, path: Path,
-                     max_features: int = MAX_FEATURES) -> None:
+                     max_features: int = None) -> None:
     """Write one SRAM row per line: all max_features FP16 values packed as one hex word.
 
     Feature n occupies bits [n*16+15 : n*16] (feature 0 = LSB).
     $readmemh reads MSB-first, so the hex string is feature[max_features-1]...feature[0].
     Features beyond weights.shape[1] are zero-padded.
     """
+    if max_features is None:
+        max_features = MAX_FEATURES
     hidden, nfeat = weights.shape
     hex_chars = max_features * 4   # bits per row / 4
     with open(path, "w") as f:
@@ -146,7 +148,7 @@ def write_threshold_hex(count_k: int, thresholds: np.ndarray, path: Path) -> Non
 
 
 def write_weight_bin(weights: np.ndarray, path: Path,
-                     max_features: int = MAX_FEATURES) -> None:
+                     max_features: int = None) -> None:
     """Write weight SRAM binary for DCR streaming via VX_DCR_CHECKER_WEIGHT_DATA.
 
     Format: [hidden_size × max_features] FP16, row-major, little-endian.
@@ -156,6 +158,8 @@ def write_weight_bin(weights: np.ndarray, path: Path,
     of the first uint32 word), matching the weight_wbuf bit layout in
     VX_cluster.sv: w_wbuf[word_idx*32 +: 32] → features [2*word_idx, 2*word_idx+1].
     """
+    if max_features is None:
+        max_features = MAX_FEATURES
     hidden, nfeat = weights.shape
     padded = np.zeros((hidden, max_features), dtype=np.float16)
     padded[:, :nfeat] = weights.astype(np.float16)
@@ -629,6 +633,7 @@ def build_suite() -> list[TestCase]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global MAX_FEATURES
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--verbose", "-v", action="store_true",
@@ -637,7 +642,13 @@ def main() -> None:
                    help="Only run tests whose name contains this substring")
     p.add_argument("--max-ulp", type=int, default=1,
                    help="Max FP16 ULP distance allowed for matrix values (default: 1)")
+    p.add_argument("--max-features", type=int, default=MAX_FEATURES,
+                   help=f"weight-SRAM column count; must equal the RTL build's "
+                        f"VX_CHECKER_MAX_FEATURES (default {MAX_FEATURES})")
     args = p.parse_args()
+
+    # Override the SRAM row width to match the RTL build (-DVX_CHECKER_MAX_FEATURES).
+    MAX_FEATURES = args.max_features
 
     suite = build_suite()
     if args.filter:

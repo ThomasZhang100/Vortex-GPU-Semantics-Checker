@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-MAX_FEATURES = 256   # must match VX_checker.sv MAX_FEATURES
+MAX_FEATURES = 256   # default; must match VX_checker MAX_FEATURES (-DVX_CHECKER_MAX_FEATURES)
 TEST_DIR = Path(__file__).parent
 
 
@@ -48,9 +48,9 @@ def srand_to_numpy(srand_seed: int, count: int) -> np.ndarray:
 
 
 def gen_mode2_files(M: int, K: int, num_features: int, count_k: int,
-                    seed: int, out_prefix: str) -> None:
-    assert num_features <= MAX_FEATURES, \
-        f"num_features ({num_features}) exceeds MAX_FEATURES ({MAX_FEATURES})"
+                    seed: int, out_prefix: str, max_features: int = MAX_FEATURES) -> None:
+    assert num_features <= max_features, \
+        f"num_features ({num_features}) exceeds MAX_FEATURES ({max_features})"
 
     rng = np.random.default_rng(seed)
 
@@ -83,12 +83,12 @@ def gen_mode2_files(M: int, K: int, num_features: int, count_k: int,
     # SAE decoder weights W_sae [K × num_features], random, zero-padded to MAX_FEATURES.
     # -----------------------------------------------------------------------
     W_sae_f32 = rng.normal(0.0, 0.1, (K, num_features)).astype(np.float32)
-    padded = np.zeros((K, MAX_FEATURES), dtype=np.float16)
+    padded = np.zeros((K, max_features), dtype=np.float16)
     padded[:, :num_features] = W_sae_f32.astype(np.float16)
 
     weight_path = TEST_DIR / f"{out_prefix}_weights.bin"
     padded.tofile(weight_path)
-    print(f"Wrote {weight_path}  ({K} × {MAX_FEATURES} FP16 = {weight_path.stat().st_size} bytes)")
+    print(f"Wrote {weight_path}  ({K} × {max_features} FP16 = {weight_path.stat().st_size} bytes)")
 
     # -----------------------------------------------------------------------
     # Thresholds: calibrate to A_hidden * W_sae output distribution.
@@ -139,7 +139,10 @@ def main() -> None:
     p.add_argument("--hidden",    "-H", type=int, default=64,
                    help="hidden size K = inner dim = output dim of GEMM1 (default 64)")
     p.add_argument("--features",  "-F", type=int, default=32,
-                   help="number of SAE features (<= MAX_FEATURES=256, default 32)")
+                   help="number of SAE features (<= --max-features, default 32)")
+    p.add_argument("--max-features", type=int, default=MAX_FEATURES,
+                   help=f"weight-SRAM column count; must equal the RTL "
+                        f"VX_CHECKER_MAX_FEATURES (default {MAX_FEATURES})")
     p.add_argument("--count-k",   "-k", type=int, default=16,
                    help="count-k threshold (default 16)")
     p.add_argument("--seed",      "-s", type=int, default=0,
@@ -148,8 +151,8 @@ def main() -> None:
                    help="output file prefix (default 'mode2')")
     args = p.parse_args()
 
-    if args.features > MAX_FEATURES:
-        print(f"Error: --features {args.features} > MAX_FEATURES={MAX_FEATURES}", file=sys.stderr)
+    if args.features > args.max_features:
+        print(f"Error: --features {args.features} > --max-features={args.max_features}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Generating mode-2 checker files:")
@@ -158,7 +161,7 @@ def main() -> None:
     print(f"  X seed=51  W1 seed=52  (matching main.cpp srand values)")
     print()
     gen_mode2_files(args.tokens, args.hidden, args.features, args.count_k,
-                    args.seed, args.out_prefix)
+                    args.seed, args.out_prefix, args.max_features)
 
 
 if __name__ == "__main__":

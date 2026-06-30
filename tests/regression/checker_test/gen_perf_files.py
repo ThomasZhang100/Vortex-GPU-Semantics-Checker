@@ -20,28 +20,30 @@ from pathlib import Path
 
 import numpy as np
 
-MAX_FEATURES = 256   # must match VX_checker.sv MAX_FEATURES parameter
+MAX_FEATURES = 256   # default; must match VX_checker MAX_FEATURES (-DVX_CHECKER_MAX_FEATURES)
 TEST_DIR     = Path(__file__).parent
 
 
-def gen_perf_files(hidden: int, num_features: int, count_k: int, seed: int) -> None:
-    assert num_features <= MAX_FEATURES, \
-        f"num_features ({num_features}) exceeds MAX_FEATURES ({MAX_FEATURES})"
+def gen_perf_files(hidden: int, num_features: int, count_k: int, seed: int,
+                   max_features: int = MAX_FEATURES) -> None:
+    assert num_features <= max_features, \
+        f"num_features ({num_features}) exceeds MAX_FEATURES ({max_features})"
     assert hidden > 0 and num_features > 0
 
     rng = np.random.default_rng(seed)
 
     # ------------------------------------------------------------------
-    # Weight binary: [hidden × MAX_FEATURES] FP16, zero-padded per row.
+    # Weight binary: [hidden × max_features] FP16, zero-padded per row.
     # Features beyond num_features are zero so the checker ignores them.
+    # The row width must equal the RTL weight-SRAM width (MAX_FEATURES).
     # ------------------------------------------------------------------
     weights_f32 = rng.normal(0.0, 0.1, (hidden, num_features)).astype(np.float32)
-    padded = np.zeros((hidden, MAX_FEATURES), dtype=np.float16)
+    padded = np.zeros((hidden, max_features), dtype=np.float16)
     padded[:, :num_features] = weights_f32.astype(np.float16)
 
     weight_path = TEST_DIR / "weights_perf.bin"
     padded.tofile(weight_path)
-    print(f"Wrote {weight_path}  ({hidden} × {MAX_FEATURES} FP16 = {weight_path.stat().st_size} bytes)")
+    print(f"Wrote {weight_path}  ({hidden} × {max_features} FP16 = {weight_path.stat().st_size} bytes)")
 
     # ------------------------------------------------------------------
     # Threshold binary: [num_features+1] uint16.
@@ -84,20 +86,23 @@ def main() -> None:
     p.add_argument("--hidden",    "-H", type=int, default=512,
                    help="hidden_size (rows of weight SRAM, == -H in checker_test)")
     p.add_argument("--features",  "-F", type=int, default=64,
-                   help="num_features (<= MAX_FEATURES=256)")
+                   help="num_features (<= --max-features)")
+    p.add_argument("--max-features", type=int, default=MAX_FEATURES,
+                   help=f"weight-SRAM column count; must equal the RTL "
+                        f"VX_CHECKER_MAX_FEATURES (default {MAX_FEATURES})")
     p.add_argument("--count-k",   "-k", type=int, default=32,
                    help="count threshold k (flag fires when fired_count > k)")
     p.add_argument("--seed",      "-s", type=int, default=0,
                    help="RNG seed for reproducibility")
     args = p.parse_args()
 
-    if args.features > MAX_FEATURES:
-        print(f"Error: --features {args.features} exceeds MAX_FEATURES={MAX_FEATURES}", file=sys.stderr)
+    if args.features > args.max_features:
+        print(f"Error: --features {args.features} exceeds --max-features={args.max_features}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Generating perf files: hidden={args.hidden}  features={args.features}  "
-          f"count_k={args.count_k}  seed={args.seed}")
-    gen_perf_files(args.hidden, args.features, args.count_k, args.seed)
+          f"max_features={args.max_features}  count_k={args.count_k}  seed={args.seed}")
+    gen_perf_files(args.hidden, args.features, args.count_k, args.seed, args.max_features)
     print()
     print("Run with checker:")
     print(f"  ./ci/blackbox.sh --driver=rtlsim --cores=2 --app=checker_test \\")

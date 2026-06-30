@@ -43,10 +43,18 @@
 `define VX_DCR_CHECKER_TRIG_ADDR_LO1   12'h01A  // trigger range low  [63:32] (XLEN_64 only)
 `define VX_DCR_CHECKER_TRIG_ADDR_HI1   12'h01B  // trigger range high [63:32] (XLEN_64 only)
 
-// Checker compile-time geometry — must match VX_checker.sv parameter defaults.
-// Exposed here so the host driver (main.cpp, vx_dcr_write) can compute buffer sizes.
+// Checker compile-time geometry — the checker's weight-SRAM capacity (build-time).
+// Single source of truth: RTL (VX_cluster, VX_checker_synth_top), the kernel, and the
+// host (main.cpp) all derive from these, so they stay in sync.  Override at build time
+// with -DVX_CHECKER_MAX_FEATURES=<n> / -DVX_CHECKER_MAX_HIDDEN=<n> (e.g. in CONFIGS) to
+// shrink the SRAM for synthesis area runs or to match a test config.  MAX_FEATURES must
+// stay a multiple of N_FEAT (=8).  Distinct from the *runtime* -F/-H/-T (DCR-driven).
+`ifndef VX_CHECKER_MAX_FEATURES
 `define VX_CHECKER_MAX_FEATURES         256      // SRAM columns (FP16 values per row)
+`endif
+`ifndef VX_CHECKER_MAX_HIDDEN
 `define VX_CHECKER_MAX_HIDDEN           2048     // SRAM depth (rows)
+`endif
 
 `define VX_DCR_BASE_STATE(addr)         ((addr) - `VX_DCR_BASE_STATE_BEGIN)
 `define VX_DCR_BASE_STATE_COUNT         (`VX_DCR_BASE_STATE_END-`VX_DCR_BASE_STATE_BEGIN)

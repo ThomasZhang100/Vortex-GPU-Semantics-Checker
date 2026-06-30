@@ -126,6 +126,10 @@ run_app() {
     [ $TEMPBUILD -eq 1 ] && cmd_opts=$(add_option "$cmd_opts" "VORTEX_RT_PATH=\"$TEMPDIR\"")
     [ $HAS_ARGS -eq 1 ] && cmd_opts=$(add_option "$cmd_opts" "OPTS=\"$ARGS\"")
     [ $HAS_NP -eq 1 ] && cmd_opts=$(add_option "$cmd_opts" "NP=$NP")
+    # Forward CONFIGS to the app build so the host (main.cpp) and kernel see the same
+    # compile-time defines as the RTL driver — e.g. -DVX_CHECKER_MAX_FEATURES must match
+    # between the hardware SRAM width and the host's weight-streaming loop.
+    [ -n "$CONFIGS" ] && cmd_opts=$(add_option "$cmd_opts" "CONFIGS=\"$CONFIGS\"")
     cmd_opts=$(add_option "$cmd_opts" "make -C \"$APP_PATH\" run-$DRIVER")
     [ $DEBUG -ne 0 ] && cmd_opts=$(add_option "$cmd_opts" "> $LOGFILE 2>&1")
     echo "Running: $cmd_opts"
