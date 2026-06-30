@@ -392,6 +392,17 @@ module VX_checker import VX_gpu_pkg::*; #(
     end
 
     // -------------------------------------------------------------------------
+    // Narrow the incoming cache line (LINE_WORDS FP32 words) to FP16 once, shared
+    // across all B_TILE rows and both FIFO-write branches below.  Those all narrow
+    // the same rsp_data, so computing it here — instead of re-calling fp32_to_fp16 at
+    // each FIFO write — avoids B_TILE*2 redundant copies of the converter that the
+    // synthesizer would otherwise build and then have to merge.
+    logic [15:0] line_fp16 [LINE_WORDS];
+    always_comb begin
+        for (int w = 0; w < LINE_WORDS; w++)
+            line_fp16[w] = fp32_to_fp16(act_bus_if.rsp_data.data[w*32 +: 32]);
+    end
+
     // FIFO update (resets each pass)
     // -------------------------------------------------------------------------
     always_ff @(posedge clk) begin
@@ -421,14 +432,14 @@ module VX_checker import VX_gpu_pkg::*; #(
                         for (int w = 0; w < LINE_WORDS; w++) begin
                             if (w >= int'(row_skip[b]))
                                 fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w - int'(row_skip[b])))]
-                                    <= fp32_to_fp16(act_bus_if.rsp_data.data[w*32 +: 32]);
+                                    <= line_fp16[w];
                         end
                         wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b]
                                      + FIFO_PTR_W'(LINE_WORDS - int'(row_skip[b])));
                     end else begin
                         for (int w = 0; w < LINE_WORDS; w++)
                             fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w))]
-                                <= fp32_to_fp16(act_bus_if.rsp_data.data[w*32 +: 32]);
+                                <= line_fp16[w];
                         wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
                     end
                 end
