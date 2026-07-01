@@ -99,6 +99,11 @@ module VX_checker import VX_gpu_pkg::*; #(
     localparam FIFO_PTR_W      = `CLOG2(FIFO_DEPTH);
     localparam FIFO_CTR_W      = `CLOG2(FIFO_DEPTH + 1);
     localparam FIFO_HALF       = FIFO_DEPTH / 2;
+    // Line-granular FIFO storage: whole cache-line slots instead of word slots, so a
+    // response is written at a single index (no barrel shifter).  count stays in words.
+    localparam FIFO_LINES      = FIFO_DEPTH / LINE_WORDS;  // whole-line slots (>=2)
+    localparam FIFO_LINE_W     = `CLOG2(FIFO_LINES);       // line-slot index width
+    localparam RD_WORD_W       = `CLOG2(LINE_WORDS);       // word-within-line index width
     localparam CHUNKS_W        = 12;
     localparam ROW_ID_BITS     = `CLOG2(B_TILE);
 
@@ -317,9 +322,13 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     // Per-row FIFO storage
     // -------------------------------------------------------------------------
-    logic [B_TILE-1:0][FIFO_DEPTH-1:0][15:0] fifo;
-    logic [B_TILE-1:0][FIFO_PTR_W-1:0]       rd_ptr, wr_ptr;
-    logic [B_TILE-1:0][FIFO_CTR_W-1:0]       count;
+    // Storage is FIFO_LINES slots of one cache line (LINE_WORDS FP16 packed) per row.
+    // A whole L2 response is written to one slot (single index → no barrel shifter);
+    // the systolic array reads one word/cycle via a line-select + word part-select.
+    logic [B_TILE-1:0][FIFO_LINES-1:0][LINE_WORDS*16-1:0] fifo;
+    logic [B_TILE-1:0][FIFO_LINE_W-1:0]      rd_line, wr_line;
+    logic [B_TILE-1:0][RD_WORD_W-1:0]        rd_word; // word in current read line; starts at row_skip
+    logic [B_TILE-1:0][FIFO_CTR_W-1:0]       count;   // valid words buffered (unchanged semantics)
 
     logic [B_TILE-1:0][CHUNKS_W-1:0] next_chunk;
     // Block chunk N+1 until chunk N's response arrives: DRAM misses can return
@@ -403,19 +412,38 @@ module VX_checker import VX_gpu_pkg::*; #(
             line_fp16[w] = fp32_to_fp16(act_bus_if.rsp_data.data[w*32 +: 32]);
     end
 
+    // Pack the narrowed cache line into one FIFO slot word (bits w*16 +: 16 = word w).
+    logic [LINE_WORDS*16-1:0] line_packed;
+    always_comb begin
+        for (int w = 0; w < LINE_WORDS; w++)
+            line_packed[w*16 +: 16] = line_fp16[w];
+    end
+
     // FIFO update (resets each pass)
     // -------------------------------------------------------------------------
+    // Line-granular: each response writes one whole line into wr_line's slot, and the
+    // read walks word-by-word (rd_word) across slots (rd_line).  row_skip is handled on
+    // the read side — the first line's leading row_skip words are stored but never read
+    // because rd_word starts at row_skip.  count / first_chunk_done / k_count logic is
+    // unchanged, so prefetch level and drain timing match the previous word-granular design.
     always_ff @(posedge clk) begin
         if (reset || pass_reset) begin
             for (int b = 0; b < B_TILE; b++) begin
-                rd_ptr[b]  <= '0;
-                wr_ptr[b]  <= '0;
+                rd_line[b] <= '0;
+                wr_line[b] <= '0;
+                rd_word[b] <= '0;
                 count[b]   <= '0;
                 k_count[b] <= '0;
             end
             k_started        <= '0;
             first_chunk_done <= '0;
         end else if (state == ACTIVE) begin
+            // Start the first read line at row_skip (committed via pass_reset_r, one
+            // cycle after row_start_r settles — well before the first pop).
+            if (pass_reset_r)
+                for (int b = 0; b < B_TILE; b++)
+                    rd_word[b] <= RD_WORD_W'(row_skip[b]);
+
             if (!k_started[0] && (count[0] > '0))
                 k_started[0] <= 1'b1;
             for (int b = 1; b < B_TILE; b++)
@@ -425,31 +453,25 @@ module VX_checker import VX_gpu_pkg::*; #(
             for (int b = 0; b < B_TILE; b++) begin
                 if (row_push[b]) begin
                     first_chunk_done[b] <= 1'b1;
-                    if (!first_chunk_done[b]) begin
-                        // First cache-line response: skip row_skip[b] leading FP32
-                        // elements that belong to the previous token's cache line.
-                        // Each surviving element is narrowed to FP16 before storage.
-                        for (int w = 0; w < LINE_WORDS; w++) begin
-                            if (w >= int'(row_skip[b]))
-                                fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w - int'(row_skip[b])))]
-                                    <= line_fp16[w];
-                        end
-                        wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b]
-                                     + FIFO_PTR_W'(LINE_WORDS - int'(row_skip[b])));
-                    end else begin
-                        for (int w = 0; w < LINE_WORDS; w++)
-                            fifo[b][FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(w))]
-                                <= line_fp16[w];
-                        wr_ptr[b] <= FIFO_PTR_W'(wr_ptr[b] + FIFO_PTR_W'(LINE_WORDS));
-                    end
+                    // Whole-line write at a single slot index (no barrel shifter).
+                    fifo[b][wr_line[b]] <= line_packed;
+                    wr_line[b] <= (wr_line[b] == FIFO_LINE_W'(FIFO_LINES-1))
+                                  ? '0 : wr_line[b] + FIFO_LINE_W'(1);
                 end
                 if (row_pop[b]) begin
-                    rd_ptr[b]  <= rd_ptr[b] + FIFO_PTR_W'(1);
+                    // Advance the read word; wrap into the next line slot at LINE_WORDS.
+                    if (rd_word[b] == RD_WORD_W'(LINE_WORDS-1)) begin
+                        rd_word[b] <= '0;
+                        rd_line[b] <= (rd_line[b] == FIFO_LINE_W'(FIFO_LINES-1))
+                                      ? '0 : rd_line[b] + FIFO_LINE_W'(1);
+                    end else begin
+                        rd_word[b] <= rd_word[b] + RD_WORD_W'(1);
+                    end
                     k_count[b] <= k_count[b] + 16'(1);
                 end
                 begin : count_update
                     // push_words: actual FP16 elements written this push (first chunk
-                    // writes fewer if the row is not cache-line aligned).
+                    // contributes fewer if the row is not cache-line aligned).
                     automatic logic [FIFO_CTR_W-1:0] push_words =
                         (!first_chunk_done[b])
                             ? FIFO_CTR_W'(LINE_WORDS - int'(row_skip[b]))
@@ -545,7 +567,8 @@ module VX_checker import VX_gpu_pkg::*; #(
     /* verilator lint_on ASCRANGE */
     generate
         for (genvar b = 0; b < B_TILE; b++) begin : g_sa_ain
-            assign sa_a_in[b] = (k_started[b] && !k_done[b]) ? fifo[b][rd_ptr[b]] : 16'h0;
+            assign sa_a_in[b] = (k_started[b] && !k_done[b])
+                ? fifo[b][rd_line[b]][rd_word[b]*16 +: 16] : 16'h0;
         end
     endgenerate
 
