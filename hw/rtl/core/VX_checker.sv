@@ -96,7 +96,6 @@ module VX_checker import VX_gpu_pkg::*; #(
     localparam LINE_BYTES      = `L1_LINE_SIZE;
     localparam LINE_BITS       = `CLOG2(LINE_BYTES);
     localparam LOG_LW          = `CLOG2(LINE_WORDS);
-    localparam FIFO_PTR_W      = `CLOG2(FIFO_DEPTH);
     localparam FIFO_CTR_W      = `CLOG2(FIFO_DEPTH + 1);
     localparam FIFO_HALF       = FIFO_DEPTH / 2;
     // Line-granular FIFO storage: whole cache-line slots instead of word slots, so a
