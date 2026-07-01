@@ -50,6 +50,11 @@ checkErrors()
         exit 1
     fi
 
+    # -W: allow warnings (only hard errors, checked above, fail the run)
+    if [ "$no_warnings" -eq 0 ]; then
+        return
+    fi
+
     count=0
     while IFS= read -r line; do
         if [[ "$line" == *"Warning:"* ]]; then
@@ -132,9 +137,15 @@ done
     # black-box requested modules: keep their interface but drop their contents, so
     # synthesis excludes them from the gate count.  Used for compiled SRAM macros whose
     # area/power is quoted from a memory-compiler datasheet rather than standard cells.
-    for bb in "${blackbox_list[@]}"; do
-        echo "blackbox $bb"
-    done
+    # Elaborate first so parameterized modules exist under their derived $paramod name,
+    # then match by wildcard (blackboxing the base module alone doesn't stick — synth
+    # re-derives the parameterized copy with its contents intact).
+    if [ ${#blackbox_list[@]} -gt 0 ]; then
+        echo "hierarchy -top $top_level"
+        for bb in "${blackbox_list[@]}"; do
+            echo "blackbox *$bb*"
+        done
+    fi
 
     # elaborate
     if echo "$process" | grep -q "elaborate"; then
