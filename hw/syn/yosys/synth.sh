@@ -67,8 +67,9 @@ checkErrors()
 }
 
 usage() { echo "$0 usage:" && grep " .)\ #" $0; exit 0; }
+blackbox_list=()
 [ $# -eq 0 ] && usage
-while getopts "c:l:s:t:I:D:P:Wh" arg; do
+while getopts "c:l:s:t:I:D:P:B:Wh" arg; do
     case $arg in
     l) # library
         library=${OPTARG}
@@ -91,6 +92,9 @@ while getopts "c:l:s:t:I:D:P:Wh" arg; do
         ;;
     P) # process
         process=${OPTARG}
+        ;;
+    B) # black-box module (exclude its internals from synthesis, e.g. an SRAM macro)
+        blackbox_list+=(${OPTARG})
         ;;
     W) # allow warnings
         no_warnings=0
@@ -124,6 +128,13 @@ done
     if [ -n "$source" ]; then
         echo "read_verilog -defer -nolatches $macro_args $inc_args -sv $source"
     fi
+
+    # black-box requested modules: keep their interface but drop their contents, so
+    # synthesis excludes them from the gate count.  Used for compiled SRAM macros whose
+    # area/power is quoted from a memory-compiler datasheet rather than standard cells.
+    for bb in "${blackbox_list[@]}"; do
+        echo "blackbox $bb"
+    done
 
     # elaborate
     if echo "$process" | grep -q "elaborate"; then

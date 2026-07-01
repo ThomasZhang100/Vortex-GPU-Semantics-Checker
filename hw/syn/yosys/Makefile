@@ -111,8 +111,11 @@ build: $(BUILD_DIR)/project.v
 elaborate: $(BUILD_DIR)/project.v
 	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v -P="elaborate"
 
+# BLACKBOX="mod1 mod2" excludes those modules from synthesis (e.g. BLACKBOX=VX_dp_ram
+# for the checker weight SRAM — quote its area from a memory-compiler datasheet instead).
+# ALLOW_WARN=1 lets synthesis finish despite Yosys warnings (otherwise treated as errors).
 synthesis: $(BUILD_DIR)/project.v
-	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v -P="synthesis"
+	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v -P="synthesis" $(foreach m,$(BLACKBOX),-B$(m)) $(if $(ALLOW_WARN),-W)
 
 clean:
 	$(RMDIR) $(BUILD_DIR)
