@@ -73,8 +73,9 @@ checkErrors()
 
 usage() { echo "$0 usage:" && grep " .)\ #" $0; exit 0; }
 blackbox_list=()
+keep_list=()
 [ $# -eq 0 ] && usage
-while getopts "c:l:s:t:I:D:P:B:Wh" arg; do
+while getopts "c:l:s:t:I:D:P:B:K:Wh" arg; do
     case $arg in
     l) # library
         library=${OPTARG}
@@ -100,6 +101,9 @@ while getopts "c:l:s:t:I:D:P:B:Wh" arg; do
         ;;
     B) # black-box module (exclude its internals from synthesis, e.g. an SRAM macro)
         blackbox_list+=(${OPTARG})
+        ;;
+    K) # keep module (mark keep so DCE can't strip it, e.g. a block with a dead output)
+        keep_list+=(${OPTARG})
         ;;
     W) # allow warnings
         no_warnings=0
@@ -134,16 +138,21 @@ done
         echo "read_verilog -defer -nolatches $macro_args $inc_args -sv $source"
     fi
 
-    # black-box requested modules: keep their interface but drop their contents, so
-    # synthesis excludes them from the gate count.  Used for compiled SRAM macros whose
-    # area/power is quoted from a memory-compiler datasheet rather than standard cells.
-    # Elaborate first so parameterized modules exist under their derived $paramod name,
-    # then match by wildcard (blackboxing the base module alone doesn't stick — synth
-    # re-derives the parameterized copy with its contents intact).
-    if [ ${#blackbox_list[@]} -gt 0 ]; then
+    # black-box / keep requested modules.  Elaborate first so parameterized modules
+    # exist under their derived $paramod name, then match by wildcard.
+    #  -B: blackbox — keep the interface but drop the contents, so synthesis excludes
+    #      them from the gate count (compiled SRAM macros quoted from a datasheet).
+    #      Matching the base module alone doesn't stick (synth re-derives the
+    #      parameterized copy with contents), so this must run after hierarchy.
+    #  -K: keep — mark the module so DCE can't strip it; needed to measure a block
+    #      whose output isn't observable at the top (e.g. a flag that only feeds sim).
+    if [ ${#blackbox_list[@]} -gt 0 ] || [ ${#keep_list[@]} -gt 0 ]; then
         echo "hierarchy -top $top_level"
         for bb in "${blackbox_list[@]}"; do
             echo "blackbox *$bb*"
+        done
+        for kk in "${keep_list[@]}"; do
+            echo "setattr -mod -set keep 1 *$kk*"
         done
     fi
 

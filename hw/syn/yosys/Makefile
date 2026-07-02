@@ -111,11 +111,14 @@ build: $(BUILD_DIR)/project.v
 elaborate: $(BUILD_DIR)/project.v
 	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v -P="elaborate"
 
-# BLACKBOX="mod1 mod2" excludes those modules from synthesis (e.g. BLACKBOX=VX_dp_ram
-# for the checker weight SRAM — quote its area from a memory-compiler datasheet instead).
+# BLACKBOX="mod1 mod2" excludes those modules from synthesis (e.g. all RAM primitives —
+#   BLACKBOX="VX_dp_ram VX_sp_ram VX_async_ram_patch" — so SRAM isn't FF-mapped; quote it
+#   from a memory-compiler datasheet instead).
+# KEEP="mod1 mod2" marks modules so DCE can't strip them (e.g. KEEP=VX_checker to measure a
+#   block whose output isn't wired to a top-level pin).
 # ALLOW_WARN=1 lets synthesis finish despite Yosys warnings (otherwise treated as errors).
 synthesis: $(BUILD_DIR)/project.v
-	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v -P="synthesis" $(foreach m,$(BLACKBOX),-B$(m)) $(if $(ALLOW_WARN),-W)
+	cd $(BUILD_DIR); $(SRC_DIR)/synth.sh -t$(TOP_LEVEL_ENTITY) -sproject.v -P="synthesis" $(foreach m,$(BLACKBOX),-B$(m)) $(foreach m,$(KEEP),-K$(m)) $(if $(ALLOW_WARN),-W)
 
 clean:
 	$(RMDIR) $(BUILD_DIR)
