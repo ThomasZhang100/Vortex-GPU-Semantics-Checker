@@ -181,8 +181,8 @@ done
         echo "write_verilog synth.v"
     fi
 
-    # Generate a summary report
-    echo "stat"
+    # Generate a summary report (-tech cmos adds an estimated transistor count)
+    echo "stat -tech cmos"
 } > synth.ys
 
 yosys -l yosys.log -s synth.ys
