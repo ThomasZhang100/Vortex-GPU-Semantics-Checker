@@ -53,11 +53,13 @@ for pair in "${GRID[@]}"; do
   make clean >/dev/null 2>&1 || true
 
   # Pass 1: whole checker logic (RAM black-boxed) -> total
-  make synthesis TOP_LEVEL_ENTITY=$TOP CONFIGS="$cfg" BLACKBOX="$RAMS"
+  # ALLOW_WARN=1: the flattened synth wrapper emits a few benign warnings
+  # (unused request-payload ports, width tweaks); don't let them abort the sweep.
+  make synthesis TOP_LEVEL_ENTITY=$TOP CONFIGS="$cfg" BLACKBOX="$RAMS" ALLOW_WARN=1
   total=$(transistors)
 
   # Pass 2: also black-box the PE array -> control/glue base (reuses project.v)
-  make synthesis TOP_LEVEL_ENTITY=$TOP CONFIGS="$cfg" BLACKBOX="$RAMS sa_array"
+  make synthesis TOP_LEVEL_ENTITY=$TOP CONFIGS="$cfg" BLACKBOX="$RAMS sa_array" ALLOW_WARN=1
   base=$(transistors)
 
   array=$((total - base))
