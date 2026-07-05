@@ -50,7 +50,9 @@ for pair in "${GRID[@]}"; do
   echo "==================================================================="
 
   # CONFIGS changed => project.v must be regenerated, so wipe the build dir.
-  make clean >/dev/null 2>&1 || true
+  # NOTE: clean must get the same TOP_LEVEL_ENTITY, else BUILD_DIR defaults to
+  # build_Vortex and the stale build_$TOP/project.v is silently reused.
+  make clean TOP_LEVEL_ENTITY=$TOP >/dev/null 2>&1 || true
 
   # Pass 1: whole checker logic (RAM black-boxed) -> total
   # ALLOW_WARN=1: the flattened synth wrapper emits a few benign warnings
