@@ -55,6 +55,15 @@
 `ifndef VX_CHECKER_MAX_HIDDEN
 `define VX_CHECKER_MAX_HIDDEN           2048     // SRAM depth (rows)
 `endif
+// Physical systolic-array geometry (PE grid = B_TILE rows x N_FEAT cols).  Overridable
+// at build time for area-vs-array-size sweeps.  Constraints: MAX_FEATURES % N_FEAT == 0
+// and MAX_BATCH % B_TILE == 0.
+`ifndef VX_CHECKER_N_FEAT
+`define VX_CHECKER_N_FEAT               8        // array columns
+`endif
+`ifndef VX_CHECKER_B_TILE
+`define VX_CHECKER_B_TILE              4        // array rows
+`endif
 
 `define VX_DCR_BASE_STATE(addr)         ((addr) - `VX_DCR_BASE_STATE_BEGIN)
 `define VX_DCR_BASE_STATE_COUNT         (`VX_DCR_BASE_STATE_END-`VX_DCR_BASE_STATE_BEGIN)

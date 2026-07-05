@@ -25,6 +25,8 @@
 module VX_checker_synth_top import VX_gpu_pkg::*; #(
     parameter MAX_HIDDEN   = `VX_CHECKER_MAX_HIDDEN,
     parameter MAX_FEATURES = `VX_CHECKER_MAX_FEATURES,
+    parameter N_FEAT       = `VX_CHECKER_N_FEAT,
+    parameter B_TILE       = `VX_CHECKER_B_TILE,
     parameter MAX_BATCH    = 16
 ) (
     input  wire clk,
@@ -82,6 +84,8 @@ module VX_checker_synth_top import VX_gpu_pkg::*; #(
     VX_checker #(
         .MAX_HIDDEN   (MAX_HIDDEN),
         .MAX_FEATURES (MAX_FEATURES),
+        .N_FEAT       (N_FEAT),
+        .B_TILE       (B_TILE),
         .MAX_BATCH    (MAX_BATCH)
     ) sem_checker (
         .clk              (clk),
