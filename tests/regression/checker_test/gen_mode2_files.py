@@ -29,19 +29,17 @@ import numpy as np
 
 MAX_FEATURES = 256   # default; must match VX_checker MAX_FEATURES (-DVX_CHECKER_MAX_FEATURES)
 TEST_DIR = Path(__file__).parent
+# Portable location of the generated .bin files in printed run commands. Set
+# VORTEX_HOME to your Vortex checkout root, e.g.
+#   export VORTEX_HOME=$(git rev-parse --show-toplevel)
+VXH_DIR  = "$VORTEX_HOME/tests/regression/checker_test"
 
 
 def srand_to_numpy(srand_seed: int, count: int) -> np.ndarray:
-    """
-    Reproduce C stdlib rand() sequence seeded with srand_seed.
-    Returns 'count' values in [0, RAND_MAX] (RAND_MAX = 2^31-1 on glibc).
-    Uses a simple LCG matching glibc's rand(): X_{n+1} = (1103515245*X_n + 12345) mod 2^32
-    and returns (X >> 16) & 0x7fff for 15-bit rand(), or X >> 1 for 31-bit RAND_MAX.
+    """Reproducible pseudo-random sequence seeded with srand_seed.
 
-    For portability we use a fixed numpy RNG with a stable seed instead of
-    reproducing the exact LCG chain — the values just need to be reproducible
-    across host (verification) and GPU (execution), which is guaranteed because
-    main.cpp uses the same srand seeds.
+    Returns 'count' float32 values in [0, 1). Uses numpy's RNG (not glibc's LCG);
+    only reproducibility across host and GPU matters, guaranteed by shared seeds.
     """
     rng = np.random.default_rng(srand_seed)
     return rng.random(count).astype(np.float32)
@@ -54,11 +52,8 @@ def gen_mode2_files(M: int, K: int, num_features: int, count_k: int,
 
     rng = np.random.default_rng(seed)
 
-    # -----------------------------------------------------------------------
-    # Reproduce X (seed 51) and W1 (seed 52) exactly as main.cpp does.
-    # main.cpp uses srand(51)/srand(52) and rand()/RAND_MAX scaled to [-1,1]
-    # or [0,0.1].  We use numpy with the same numeric seeds for reproducibility.
-    # -----------------------------------------------------------------------
+    # Reproduce GEMM1's X (seed 51, scaled to [-1,1]) and W1 (seed 52, [0,0.1]),
+    # matching the seeds main.cpp uses.
     rng_x  = np.random.default_rng(51)
     rng_w1 = np.random.default_rng(52)
 
@@ -122,13 +117,13 @@ def gen_mode2_files(M: int, K: int, num_features: int, count_k: int,
     # Print run command.
     # -----------------------------------------------------------------------
     print()
-    print("Run with mode 2 (two-GEMM + addr-trigger):")
+    print("Run with mode 2 (two-GEMM + addr-trigger; set VORTEX_HOME to your checkout root):")
     print(f"  # -N is GEMM2 output width (independent of -H); any multiple of tile_size works.")
     print(f"  CONFIGS=\"-DCHECKER_ENABLE\" ./ci/blackbox.sh --driver=rtlsim --cores=4 \\")
     print(f"    --app=checker_test \\")
     print(f'    "--args=-T{M} -H{K} -N<out_width> -F{num_features} -t4 \\')
-    print(f"           -W {weight_path} \\")
-    print(f'           -C {thresh_path} -e 2"')
+    print(f"           -W {VXH_DIR}/{out_prefix}_weights.bin \\")
+    print(f'           -C {VXH_DIR}/{out_prefix}_thresholds.bin -e 2"')
 
 
 def main() -> None:

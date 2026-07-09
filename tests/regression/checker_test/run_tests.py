@@ -61,16 +61,13 @@ def print_fp16_hex_matrix(name, x):
         print("  " + " ".join(f"0x{v:04x}" for v in row))
 
 def fp16_matmul(activations: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """
-    Accumulate step-by-step to match the RTL's FMA systolic array (fpnew FMADD):
-      acc = fp16(fma(a[k], w[k], acc))   for k = 0..hidden-1
-    fpnew FMADD is a true fused multiply-add: a single IEEE 754 rounding on the
-    full product+addend sum.  Numpy has no native fma, so we widen to float32,
-    perform the addition there (float32 is wide enough to be exact for FP16 inputs),
-    and round the result back to float16.  This matches the RTL to within ±1 ULP.
+    """FP16 matmul mirroring the RTL's systolic FMA chain to within ±1 ULP.
 
-    activations: [batch, hidden]  — cast to fp16 before use
-    weights:     [hidden, nfeat]  — cast to fp16 before use
+    Accumulates one k-step at a time (acc = fp16(a[k]*w[k] + acc)), widening to
+    float32 for each add and rounding back to fp16.
+
+    activations: [batch, hidden]  (cast to fp16 before use)
+    weights:     [hidden, nfeat]  (cast to fp16 before use)
     Returns:     [batch, nfeat]   fp16 array
     """
     a16 = activations.astype(np.float16)
@@ -128,12 +125,10 @@ def write_weight_hex(weights: np.ndarray, path: Path,
 
 
 def write_act_bin(activations: np.ndarray, path: Path) -> None:
-    """Write FP32 activations as a raw binary file (row-major, matched by -A in main.cpp).
+    """Write FP32 activations as a raw row-major binary (loaded via main.cpp -A).
 
-    main.cpp's -A path loads raw FP32 bytes directly into matrix A; the checker
-    narrows each element to FP16 itself in hardware (VX_checker.sv's
-    fp32_to_fp16) when it taps the tensor off L2, so the file injected here
-    must stay FP32 end to end.
+    Stays FP32 end to end: the checker narrows each element to FP16 itself in
+    hardware (VX_checker.sv's fp32_to_fp16) when it taps the tensor off L2.
     """
     activations.astype(np.float32).tofile(path)
 
@@ -266,10 +261,6 @@ def parse_full_matrix(output: str, batch_size: int,
     """Parse the === FULL MATMUL OUTPUT === block.
 
     Returns float32 [batch, num_features], or None if the block is absent.
-    Lines in the block look like:
-        <time>: [CHECKER]   tok[N]: 2080 0 -0.5 ...   (%g-formatted FP16 values)
-    The FLAG VECTOR block has the same tok[N]: prefix but starts with 'flag=',
-    so scoping to the FULL MATMUL OUTPUT section avoids cross-contamination.
     """
     start = output.find("=== FULL MATMUL OUTPUT")
     if start == -1:
@@ -299,12 +290,9 @@ def parse_full_matrix(output: str, batch_size: int,
 
 def parse_fired_bitmap(output: str, batch_size: int,
                        num_features: int) -> Optional[np.ndarray]:
-    """Parse the === FIRED BITMAP === block.
+    """Parse the === FIRED BITMAP === block (the RTL's own per-feature fire decision).
 
-    This is the RTL's own per-feature firing decision (fp16_gt(sa_c_out,
-    threshold), captured via row_fired_now in VX_checker.sv) — not a value
-    recomputed in Python from the dumped matmul output.  Returns bool
-    [batch, num_features], or None if the block is absent.
+    Returns bool [batch, num_features], or None if the block is absent.
     """
     start = output.find("=== FIRED BITMAP")
     if start == -1:
@@ -345,13 +333,8 @@ def parse_checker_latency(output: str) -> Optional[int]:
 def fp16_ulp_distance(a: float, b: float) -> int:
     """Integer ULP distance between two values in FP16 bit-space.
 
-    Uses the sign-magnitude → total-order mapping:
-      positive x  →  int(x_bits)          (natural ordering)
-      negative x  → -int(x_bits & 0x7FFF) (flip so more-negative = smaller)
-
-    This means ±0 are 0 ULPs apart, and the smallest positive and negative
-    subnormals are 2 ULPs apart (through ±0).  NaN is treated as equal to NaN
-    and maximally far from anything else.
+    Maps sign-magnitude bits to a total order so ±0 are 0 ULPs apart. NaN equals
+    NaN (returns 0) and is maximally far (0x7FFF) from anything else.
     """
     def to_ordered(v: float) -> int:
         bits = int(np.float16(v).view(np.uint16))
@@ -368,13 +351,12 @@ def fp16_ulp_distance(a: float, b: float) -> int:
 def percentile_strict(out: np.ndarray, p: float) -> np.ndarray:
     """Per-column percentile that never lands exactly on a sample.
 
-    np.percentile's default linear interpolation returns an actual data
-    point whenever (B-1)*p/100 is an integer (e.g. B=5, p=25 -> rank 1.0).
-    A threshold equal bit-for-bit to one token's reference output makes
-    `ref > threshold` a knife-edge tie, so a few ULPs of RTL/reference FMA
-    rounding slop can flip the fired bit for that one token/feature. Nudge
-    the rank by half a slot whenever it would be exact so the result always
-    falls strictly between two order statistics instead.
+    Nudges the interpolation rank by half a slot when it would fall on an order
+    statistic, so a threshold is never bit-identical to a reference output
+    (which would make `ref > threshold` a rounding-sensitive tie).
+
+    out: [batch, num_features]   p: percentile in [0, 100]
+    Returns: [num_features] threshold per column.
     """
     B = out.shape[0]
     sorted_out = np.sort(out, axis=0)
@@ -512,7 +494,7 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     if latency is not None:
         print(f"  checker latency: {latency} cycles (rearm → all_done)")
 
-    # --- matrix value diagnostic (informational only — does not gate pass/fail) ---
+    # Matrix-value diagnostic (informational; does not gate pass/fail).
     rtl_matrix = parse_full_matrix(output, tc.num_tokens, tc.num_features)
     if rtl_matrix is None:
         print("  FAIL: FULL MATMUL OUTPUT block not found — cannot verify feature firing")
@@ -539,14 +521,8 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
         )
         print(f"  matrix value match (max ULP dist = {max_seen})")
 
-    # --- per-feature firing check (this is the actual pass/fail gate) -------
-    # A token's flag is just fired-count > k, so checking every feature's fired
-    # state against the reference is a strictly stronger (and more localized)
-    # check than comparing the aggregate per-token flag.
-    # fired_rtl comes straight from the RTL's own fp16_gt comparator decision
-    # (=== FIRED BITMAP === trace), not a Python-side recomputation from the
-    # dumped matmul value — so this also catches a comparator bug that happens
-    # to leave the dumped accumulator value itself correct.
+    # Per-feature firing check — the pass/fail gate. Compares the RTL's own
+    # FIRED BITMAP against the reference per-feature fired state.
     fired_rtl = parse_fired_bitmap(output, tc.num_tokens, tc.num_features)
     if fired_rtl is None:
         print("  FAIL: FIRED BITMAP block not found — cannot verify feature firing")
@@ -565,8 +541,7 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
             print(f"    ... ({len(mismatches) - 200} more)")
         return False
 
-    # Aggregate per-token flag is informational here — it's implied by the
-    # per-feature check above passing, but report it for sanity.
+    # Aggregate per-token flag (informational; implied by the per-feature check).
     flag_mismatches = [i for i in range(tc.num_tokens) if rtl_flags[i] != bool(expected[i])]
     if flag_mismatches:
         print(f"  NOTE: per-feature firing matched, but aggregate flag differs at "
@@ -633,12 +608,9 @@ def build_suite() -> list[TestCase]:
                  tile_size=2  # 2 | 6,40,16;   batch_tiles=ceil(6/4)=2 (last tile padded)
                  ).build_random(seed=8),
 
-        # --- address-range trigger (enable_mode=3): checker fires on first L2 read of B ---
-        # Same data as rand_8tok_32feat_64hidden_k8_seed0 so any output difference
-        # from the immediate-arm equivalent is caught by the same pass/fail gate.
-        # Validates the full paper mechanism: deployer programs [B_addr, B_addr+b_size)
-        # as the trigger range; the checker sits idle until the GEMM kernel's first
-        # B-matrix cache miss fires the one-shot snoop in VX_cluster.sv.
+        # --- address-range trigger (enable_mode=3): checker sits idle until the
+        # GEMM's first L2 read of B fires a one-shot snoop. Same data as the
+        # seed=5 immediate-arm case, so both paths hit the same pass/fail gate. ---
         TestCase("addr_trig_8tok_32feat_64hidden_k8",
                  num_tokens=8, num_features=32, hidden_size=64, count_k=8,
                  enable_mode=3

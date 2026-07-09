@@ -22,6 +22,10 @@ import numpy as np
 
 MAX_FEATURES = 256   # default; must match VX_checker MAX_FEATURES (-DVX_CHECKER_MAX_FEATURES)
 TEST_DIR     = Path(__file__).parent
+# Portable location of the generated .bin files in printed run commands. Set
+# VORTEX_HOME to your Vortex checkout root, e.g.
+#   export VORTEX_HOME=$(git rev-parse --show-toplevel)
+VXH_DIR      = "$VORTEX_HOME/tests/regression/checker_test"
 
 
 def gen_perf_files(hidden: int, num_features: int, count_k: int, seed: int,
@@ -104,11 +108,11 @@ def main() -> None:
           f"max_features={args.max_features}  count_k={args.count_k}  seed={args.seed}")
     gen_perf_files(args.hidden, args.features, args.count_k, args.seed, args.max_features)
     print()
-    print("Run with checker:")
+    print("Run with checker (set VORTEX_HOME to your Vortex checkout root first):")
     print(f"  ./ci/blackbox.sh --driver=rtlsim --cores=2 --app=checker_test \\")
     print(f'  "--args=-T16 -H{args.hidden} -N512 -F{args.features} -t4 \\')
-    print(f"         -W {TEST_DIR}/weights_perf.bin \\")
-    print(f'         -C {TEST_DIR}/thresholds_perf.bin -e 1"')
+    print(f"         -W {VXH_DIR}/weights_perf.bin \\")
+    print(f'         -C {VXH_DIR}/thresholds_perf.bin -e 1"')
     print()
     print("Run without checker (rebuild with CONFIGS=\"\" first):")
     print(f"  ./ci/blackbox.sh --driver=rtlsim --cores=2 --app=checker_test \\")

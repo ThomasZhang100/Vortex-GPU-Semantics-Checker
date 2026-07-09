@@ -2,23 +2,20 @@
 """
 Generate a SAE weight hex file for VX_checker simulation.
 
-The weight SRAM is MAX_HIDDEN rows × N_FEAT FP16 values.  Each hex line is one
-SRAM row (WEIGHT_DATAW = N_FEAT*16 bits wide), written big-endian so that
-feature 0 occupies the LSB of the 256-bit word:
+The weight SRAM is MAX_HIDDEN rows × N_FEAT FP16 values. Each hex line is one
+SRAM row (N_FEAT*16 bits), written so feature 0 occupies the LSB:
 
-    hex line k:  W[k][N_FEAT-1] ... W[k][1] W[k][0]   (MSB → LSB)
+    hex line k:  W[k][N_FEAT-1] ... W[k][1] W[k][0]   (MSB -> LSB)
 
-Two modes:
-  --mode identity   W[k][n] = float16(k) for all n.
-                    Used to verify the skew: at cycle t, w_pe[b][n] == float16(k_count[0]-b-n).
-  --mode ones       W[k][n] = float16(1.0) for all k < hidden_size, n.
-                    Ground-truth check: with A[b][k]=1 the expected acc[b][n] = hidden_size.
-  --mode saedec     Load real SAE decoder weights from a .npy file (shape [hidden, n_feat]).
-                    Pass the file with --weights <path>.
+Modes:
+  --mode identity   W[k][n] = float16(k) for all n. Diagnostic pattern for skew.
+  --mode ones       W[k][n] = float16(1.0) for k < hidden_size, else 0.
+  --mode saedec     Real SAE decoder weights from --weights <path>.npy
+                    (shape [hidden, n_feat]).
 
 Usage:
-  python3 gen_weights.py --mode identity --hidden 64  --nfeat 16  --out sae_weights_test.hex
-  python3 gen_weights.py --mode saedec  --weights W.npy            --out sae_weights.hex
+  python3 gen_weights.py --mode identity --hidden 64 --nfeat 16 --out sae_weights_test.hex
+  python3 gen_weights.py --mode saedec  --weights W.npy         --out sae_weights.hex
 """
 
 import argparse
@@ -35,11 +32,10 @@ def to_fp16_bits(v: float) -> int:
 
 
 def pack_row(features_fp16_bits: list[int], n_feat: int) -> int:
-    """Pack N_FEAT FP16 bit-patterns into one WEIGHT_DATAW-bit integer.
+    """Pack N_FEAT FP16 bit-patterns into one row-wide integer.
 
-    Feature 0 goes to bits [15:0], feature n to bits [n*16+15 : n*16].
-    This matches the RTL extraction:  w_pe[b][n] = w_hpipe[...][n*16 +: 16]
-    and the $readmemh big-endian convention (MSB digit first in the hex string).
+    Feature 0 goes to bits [15:0], feature n to bits [n*16+15 : n*16], matching
+    the RTL extraction w_pe[b][n] = w_hpipe[...][n*16 +: 16].
     """
     assert len(features_fp16_bits) == n_feat
     word = 0
@@ -51,11 +47,10 @@ def pack_row(features_fp16_bits: list[int], n_feat: int) -> int:
 # ── Modes ─────────────────────────────────────────────────────────────────────
 
 def gen_identity(hidden_size: int, n_feat: int, max_hidden: int) -> list[int]:
-    """W[k][n] = float16(k) for all n.
+    """W[k][n] = float16(k) for all n (0 for k >= hidden_size).
 
-    With this pattern, w_pe[b][n] at cycle t should equal float16(k_count[0]-b-n).
-    All 16 features carry the same k-index, so any misalignment between features
-    or rows is immediately visible in the trace.
+    Every feature carries the same k-index, so any row/column skew misalignment
+    is directly visible in the trace.
     """
     rows = []
     for k in range(max_hidden):
@@ -67,8 +62,7 @@ def gen_identity(hidden_size: int, n_feat: int, max_hidden: int) -> list[int]:
 def gen_ones(hidden_size: int, n_feat: int, max_hidden: int) -> list[int]:
     """W[k][n] = float16(1.0) for k < hidden_size, 0 otherwise.
 
-    With A[b][k]=1.0 for all b,k the expected dot product is exactly hidden_size
-    for every PE, providing a clean ground-truth: acc[b][n] == float16(hidden_size).
+    With A[b][k]=1.0 the expected output is acc[b][n] == float16(hidden_size).
     """
     one = to_fp16_bits(1.0)
     rows = []
