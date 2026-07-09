@@ -402,8 +402,10 @@ class TestCase:
     #   3 = address-range trigger (checker waits for first L2 read of B matrix)
     enable_mode:  int = 1
     # sgemm tile size (main.cpp -t). The host requires num_tokens, hidden_size,
-    # and out_width to all be multiples of this, so dimensions that aren't
-    # multiples of the default (4) need a smaller tile (1 divides everything).
+    # and out_width to all be multiples of this. It must also be >= 2: the tiled
+    # kernel relies on a real workgroup (group_size = tile_size**2 > 1), and
+    # tile_size=1 takes vx_spawn's per-thread path (warps_per_group=0,
+    # local_group_id=0) which deadlocks __syncthreads and aliases local memory.
     tile_size:    int = 4
     # Numpy arrays set up before running
     activations:  Optional[np.ndarray] = field(default=None, repr=False)
@@ -617,16 +619,18 @@ def build_suite() -> list[TestCase]:
                  num_tokens=4, num_features=16, hidden_size=32, count_k=2
                  ).build_negative(seed=7),
 
-        # --- non-power-of-2 counts (exercises padding zeros in last tile) ---
-        # M=5/6 aren't multiples of the default sgemm tile (4), so the host
-        # aborts before the checker runs; tile_size=1 divides every dimension.
-        TestCase("rand_5tok_20feat_48hidden_k5",
-                 num_tokens=5, num_features=20, hidden_size=48, count_k=5,
-                 tile_size=1
+        # --- non-multiple-of-tile counts (exercises padding zeros in last tile) ---
+        # These M values aren't multiples of the checker's B_TILE (4), so they
+        # force the batch-padding path. The sgemm tile must be >= 2 and divide
+        # M, hidden_size, and out_width (16), so tile_size=2 is the largest
+        # common factor; M=5 is unusable (coprime to 48 and 16) so use M=10.
+        TestCase("rand_10tok_20feat_48hidden_k5",
+                 num_tokens=10, num_features=20, hidden_size=48, count_k=5,
+                 tile_size=2  # 2 | 10,48,16;  batch_tiles=ceil(10/4)=3 (last tile padded)
                  ).build_random(seed=7),
         TestCase("rand_6tok_24feat_40hidden_k12",
                  num_tokens=6, num_features=24, hidden_size=40, count_k=12,
-                 tile_size=1
+                 tile_size=2  # 2 | 6,40,16;   batch_tiles=ceil(6/4)=2 (last tile padded)
                  ).build_random(seed=8),
 
         # --- address-range trigger (enable_mode=3): checker fires on first L2 read of B ---
