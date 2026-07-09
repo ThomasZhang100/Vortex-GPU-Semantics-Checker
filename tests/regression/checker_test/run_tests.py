@@ -189,6 +189,7 @@ def run_sim(num_tokens: int, num_features: int, hidden_size: int,
             weight_bin: Optional[Path] = None,
             thresh_bin: Optional[Path] = None,
             act_bin: Optional[Path] = None,
+            tile_size: Optional[int] = None,
             cores: int = 2, extra_app_args: str = "") -> tuple[int, str]:
     """
     Run blackbox.sh and return (returncode, combined_stdout_stderr).
@@ -197,8 +198,13 @@ def run_sim(num_tokens: int, num_features: int, hidden_size: int,
     weight_bin: FP16 weight binary loaded via -W (VX_DCR_CHECKER_WEIGHT_DATA).
     thresh_bin: uint16 threshold binary loaded via -C (VX_DCR_CHECKER_THRESH_DATA).
     act_bin:    FP32 activation binary injected via -A.
+    tile_size:  sgemm tile size (-t). The host requires num_tokens, hidden_size,
+                and out_width to all be multiples of this; leave None to use
+                main.cpp's default (4).
     """
     app_args = f"-T {num_tokens} -F {num_features} -H {hidden_size}"
+    if tile_size is not None:
+        app_args += f" -t {tile_size}"
     if weight_bin is not None:
         app_args += f" -W {weight_bin}"
     if thresh_bin is not None:
@@ -395,6 +401,10 @@ class TestCase:
     #   1 = immediate arm on ENABLE DCR write (default)
     #   3 = address-range trigger (checker waits for first L2 read of B matrix)
     enable_mode:  int = 1
+    # sgemm tile size (main.cpp -t). The host requires num_tokens, hidden_size,
+    # and out_width to all be multiples of this, so dimensions that aren't
+    # multiples of the default (4) need a smaller tile (1 divides everything).
+    tile_size:    int = 4
     # Numpy arrays set up before running
     activations:  Optional[np.ndarray] = field(default=None, repr=False)
     weights:      Optional[np.ndarray] = field(default=None, repr=False)
@@ -459,7 +469,7 @@ def run_case(tc: TestCase, verbose: bool = False, max_ulp: int = 1) -> bool:
     try:
         rc, output = run_sim(tc.num_tokens, tc.num_features, tc.hidden_size,
                              weight_bin=WEIGHT_BIN, thresh_bin=THRESH_BIN,
-                             act_bin=ACT_BIN,
+                             act_bin=ACT_BIN, tile_size=tc.tile_size,
                              extra_app_args=f"-e {tc.enable_mode}")
     except subprocess.TimeoutExpired:
         print("  FAIL: simulation timed out")
@@ -608,11 +618,15 @@ def build_suite() -> list[TestCase]:
                  ).build_negative(seed=7),
 
         # --- non-power-of-2 counts (exercises padding zeros in last tile) ---
+        # M=5/6 aren't multiples of the default sgemm tile (4), so the host
+        # aborts before the checker runs; tile_size=1 divides every dimension.
         TestCase("rand_5tok_20feat_48hidden_k5",
-                 num_tokens=5, num_features=20, hidden_size=48, count_k=5
+                 num_tokens=5, num_features=20, hidden_size=48, count_k=5,
+                 tile_size=1
                  ).build_random(seed=7),
         TestCase("rand_6tok_24feat_40hidden_k12",
-                 num_tokens=6, num_features=24, hidden_size=40, count_k=12
+                 num_tokens=6, num_features=24, hidden_size=40, count_k=12,
+                 tile_size=1
                  ).build_random(seed=8),
 
         # --- address-range trigger (enable_mode=3): checker fires on first L2 read of B ---
