@@ -119,11 +119,18 @@ def gen_mode2_files(M: int, K: int, num_features: int, count_k: int,
     print()
     print("Run with mode 2 (two-GEMM + addr-trigger; set VORTEX_HOME to your checkout root):")
     print(f"  # -N is GEMM2 output width (independent of -H); any multiple of tile_size works.")
-    print(f"  CONFIGS=\"-DCHECKER_ENABLE\" ./ci/blackbox.sh --driver=rtlsim --cores=4 \\")
+    print()
+    print("  # With the checker active:")
+    print(f'  CONFIGS="-DCHECKER_ENABLE -DCACHE_PERSIST" ./ci/blackbox.sh --driver=rtlsim --cores=4 \\')
     print(f"    --app=checker_test \\")
     print(f'    "--args=-T{M} -H{K} -N<out_width> -F{num_features} -t4 \\')
     print(f"           -W {VXH_DIR}/{out_prefix}_weights.bin \\")
     print(f'           -C {VXH_DIR}/{out_prefix}_thresholds.bin -e 2"')
+    print()
+    print("  # Baseline without the checker (rebuild first):")
+    print(f'  CONFIGS="-DCACHE_PERSIST" ./ci/blackbox.sh --driver=rtlsim --cores=4 \\')
+    print(f"    --app=checker_test \\")
+    print(f'    "--args=-T{M} -H{K} -N<out_width> -F{num_features} -t4 -e 2"')
 
 
 def main() -> None:

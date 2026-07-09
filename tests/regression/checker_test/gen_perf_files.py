@@ -109,14 +109,14 @@ def main() -> None:
     gen_perf_files(args.hidden, args.features, args.count_k, args.seed, args.max_features)
     print()
     print("Run with checker (set VORTEX_HOME to your Vortex checkout root first):")
-    print(f"  ./ci/blackbox.sh --driver=rtlsim --cores=2 --app=checker_test \\")
-    print(f'  "--args=-T16 -H{args.hidden} -N512 -F{args.features} -t4 \\')
+    print(f'  CONFIGS="-DCHECKER_ENABLE" ./ci/blackbox.sh --driver=rtlsim --cores=2 --app=checker_test \\')
+    print(f'  "--args=-T16 -H{args.hidden} -N128 -F{args.features} -t4 \\')
     print(f"         -W {VXH_DIR}/weights_perf.bin \\")
     print(f'         -C {VXH_DIR}/thresholds_perf.bin -e 1"')
     print()
     print("Run without checker (rebuild with CONFIGS=\"\" first):")
     print(f"  ./ci/blackbox.sh --driver=rtlsim --cores=2 --app=checker_test \\")
-    print(f'  "--args=-T16 -H{args.hidden} -N512 -F{args.features} -t4"')
+    print(f'  "--args=-T16 -H{args.hidden} -N128 -F{args.features} -t4"')
 
 
 if __name__ == "__main__":
