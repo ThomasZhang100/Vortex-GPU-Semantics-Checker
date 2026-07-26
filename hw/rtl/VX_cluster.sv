@@ -147,12 +147,26 @@ module VX_cluster import VX_gpu_pkg::*; #(
 
     ///////////////////////////////////////////////////////////////////////////
 
+    // Boot-attestation gate: hold all cores (sockets) in reset until the boot
+    // verifier passes.  The L2 is NOT gated — the verifier needs it to read VRAM.
+    // ATTEST_ENABLE requires CHECKER_ENABLE (the verifier reuses the checker's L2
+    // port and SAE SRAM read ports).  boot_hold survives the vx_start reset pulse
+    // (no sync reset) so a PASS latched before vx_start keeps the cores released.
+`ifdef ATTEST_ENABLE
+    logic boot_hold;
+    initial boot_hold = 1'b1;              // fail-closed: cores held until PASS
+    logic attest_busy;                     // driven in the ATTEST block below
+    wire cluster_core_reset = reset | boot_hold;
+`else
+    wire cluster_core_reset = reset;
+`endif
+
     wire [NUM_SOCKETS-1:0] per_socket_busy;
 
     // Generate all sockets
     for (genvar socket_id = 0; socket_id < NUM_SOCKETS; ++socket_id) begin : g_sockets
 
-        `RESET_RELAY (socket_reset, reset);
+        `RESET_RELAY (socket_reset, cluster_core_reset);
 
         VX_dcr_bus_if socket_dcr_bus_if();
         wire is_base_dcr_addr = (dcr_bus_if.write_addr >= `VX_DCR_BASE_STATE_BEGIN && dcr_bus_if.write_addr < `VX_DCR_BASE_STATE_END);
@@ -183,7 +197,15 @@ module VX_cluster import VX_gpu_pkg::*; #(
         );
     end
 
-    `BUFFER_EX(busy, (| per_socket_busy), 1'b1, 1, (NUM_SOCKETS > 1));
+    // Fold attestation activity into `busy` so processor::run() keeps ticking
+    // through verification (PASS: cores then take over; FAIL: busy drops so run()
+    // returns instead of spinning forever on cores that never boot).
+`ifdef ATTEST_ENABLE
+    wire cluster_busy_src = (| per_socket_busy) | attest_busy;
+`else
+    wire cluster_busy_src = (| per_socket_busy);
+`endif
+    `BUFFER_EX(busy, cluster_busy_src, 1'b1, 1, (NUM_SOCKETS > 1));
 
 `ifdef SIMULATION
     // -------------------------------------------------------------------------
@@ -536,17 +558,172 @@ module VX_cluster import VX_gpu_pkg::*; #(
     // cores 100% of L2 bandwidth.  Without DEAD_CYCLE the checker enters the
     // L2 round-robin at equal priority, incurring potential contention.
     localparam CHK_L2_PORT = NUM_SOCKETS * `L1_MEM_PORTS;
+
+    // DEAD_CYCLE gating (checker side).
 `ifdef DEAD_CYCLE
-    assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_act_bus_if.req_valid && !any_core_req;
-    assign chk_act_bus_if.req_ready = l2_core_bus_if[CHK_L2_PORT].req_ready && !any_core_req;
+    wire chk_req_valid_eff  = chk_act_bus_if.req_valid && !any_core_req;
+    wire chk_req_ready_gate = !any_core_req;
 `else
-    assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_act_bus_if.req_valid;
-    assign chk_act_bus_if.req_ready = l2_core_bus_if[CHK_L2_PORT].req_ready;
+    wire chk_req_valid_eff  = chk_act_bus_if.req_valid;
+    wire chk_req_ready_gate = 1'b1;
 `endif
+
+`ifdef ATTEST_ENABLE
+    // =====================================================================
+    // Boot attestation (Task C): manifest SRAM + boot verifier.  Time-shares
+    // the checker's L2 port (this port) and SAE SRAM reads: the verifier owns
+    // them while boot_hold=1 (cores held, checker idle); the checker owns them
+    // after PASS.  Requires CHECKER_ENABLE.
+    // =====================================================================
+    localparam ATT_WORDS = VX_attest_pkg::ATTEST_MANIFEST_WORDS; // 264
+    localparam ATT_MFW   = $clog2(ATT_WORDS);
+
+    // ---- manifest SRAM + DCR streaming ----
+    // verify_armed is a latch (no sync reset, initial 0) so it survives the
+    // vx_start reset pulse — like the checker's ENABLE.  The verifier self-starts
+    // on the rising edge of verify_armed after reset deasserts inside run().
+    logic [ATT_MFW-1:0] mf_wptr;
+    logic               mf_we;
+    logic [ATT_MFW-1:0] mf_waddr;
+    logic [31:0]        mf_wdata;
+    logic               verify_armed;
+    initial begin mf_wptr = '0; verify_armed = 1'b0; end
+    always @(posedge clk) begin
+        mf_we <= 1'b0;
+        if (dcr_bus_if.write_valid) begin
+            case (dcr_bus_if.write_addr)
+                `VX_DCR_ATTEST_MANIFEST_DATA: begin
+                    mf_we    <= 1'b1;
+                    mf_waddr <= mf_wptr;
+                    mf_wdata <= dcr_bus_if.write_data;
+                    mf_wptr  <= mf_wptr + ATT_MFW'(1);
+                end
+                `VX_DCR_ATTEST_VERIFY_START: begin
+                    if (dcr_bus_if.write_data[0]) verify_armed <= 1'b1;
+                    else begin verify_armed <= 1'b0; mf_wptr <= '0; end // rewind for a fresh stream
+                end
+                default:;
+            endcase
+        end
+    end
+
+    wire [ATT_MFW-1:0] mf_raddr;
+    wire [31:0]        mf_rdata;
+    VX_dp_ram #(
+        .DATAW (32), .SIZE (ATT_WORDS), .OUT_REG (0), .RDW_MODE ("W")
+    ) manifest_sram (
+        .clk(clk), .reset(reset),
+        .write(mf_we), .wren(1'b1), .waddr(mf_waddr), .wdata(mf_wdata),
+        .read(1'b1), .raddr(mf_raddr), .rdata(mf_rdata)
+    );
+
+    // ---- boot_hold: released on PASS, survives vx_start reset (no sync reset) ----
+    wire        boot_release, verify_done, verify_pass, verify_verifying;
+    wire [31:0] verify_status;
+    always @(posedge clk) if (boot_release) boot_hold <= 1'b0;
+
+    // Keep `busy` asserted through verification, and after a PASS hold it until the
+    // cores actually take over — their cold instruction fetch can exceed any fixed
+    // bridge, so a latch (cleared once per_socket_busy first rises) is used instead.
+    // This stops processor::run() from returning in the handoff gap.  On FAIL,
+    // boot_release never fires, so busy falls when verification ends and run()
+    // returns cleanly (cores never boot).
+    logic booted_seen;
+    always @(posedge clk) begin
+        if (reset)                  booted_seen <= 1'b0;
+        else if (| per_socket_busy) booted_seen <= 1'b1;
+    end
+    assign attest_busy = verify_verifying | (boot_release & ~booted_seen);
+
+    // ---- verifier <-> adapter/SAE wiring ----
+    wire        vmem_req_valid, vmem_req_rw, vmem_req_ready, vmem_rsp_valid;
+    wire [`MEM_ADDR_WIDTH-1:0] vmem_req_addr;
+    wire [31:0] vmem_req_wdata, vmem_rsp_data;
+    wire        vsae_req_valid, vsae_req_sel, vsae_req_ready, vsae_rsp_valid;
+    wire [31:0] vsae_req_addr, vsae_rsp_data;
+
+    // Checker SAE read ports (driven by the SAE adapter below).
+    wire        verify_active = boot_hold;
+    wire [31:0] verify_w_widx, verify_t_widx;
+    wire [31:0] verify_w_word, verify_t_word;
+
+    VX_boot_verifier #(
+        .MEM_ADDRW        (`MEM_ADDR_WIDTH),
+        .CHK_MAX_FEATURES (CHK_MAX_FEAT)
+    ) boot_verifier (
+        .clk(clk), .reset(reset),
+        .verify_armed(verify_armed),
+        .mf_raddr(mf_raddr), .mf_rdata(mf_rdata),
+        .mem_req_valid(vmem_req_valid), .mem_req_rw(vmem_req_rw),
+        .mem_req_addr(vmem_req_addr), .mem_req_wdata(vmem_req_wdata),
+        .mem_req_ready(vmem_req_ready), .mem_rsp_valid(vmem_rsp_valid), .mem_rsp_data(vmem_rsp_data),
+        .sae_req_valid(vsae_req_valid), .sae_req_sel(vsae_req_sel), .sae_req_addr(vsae_req_addr),
+        .sae_req_ready(vsae_req_ready), .sae_rsp_valid(vsae_rsp_valid), .sae_rsp_data(vsae_rsp_data),
+        .boot_release(boot_release), .done(verify_done), .pass(verify_pass),
+        .verifying(verify_verifying), .status_word(verify_status)
+    );
+    `UNUSED_VAR (verify_done);
+    `UNUSED_VAR (verify_pass);
+    `UNUSED_VAR (verify_status);
+
+    // Word<->line adapter driving the verifier's own L2 master bus.
+    VX_mem_bus_if #(
+        .DATA_SIZE (`L1_LINE_SIZE), .TAG_WIDTH (L1_MEM_ARB_TAG_WIDTH)
+    ) ver_mem_bus_if();
+    VX_boot_mem_adapter #(
+        .LINE_SIZE (`L1_LINE_SIZE), .MEM_ADDRW (`MEM_ADDR_WIDTH)
+    ) boot_mem_adapter (
+        .clk(clk), .reset(reset),
+        .mem_req_valid(vmem_req_valid), .mem_req_rw(vmem_req_rw), .mem_req_addr(vmem_req_addr),
+        .mem_req_wdata(vmem_req_wdata), .mem_req_ready(vmem_req_ready),
+        .mem_rsp_valid(vmem_rsp_valid), .mem_rsp_data(vmem_rsp_data),
+        .bus_if(ver_mem_bus_if)
+    );
+
+    // SAE read adapter: verifier word request -> checker combinational SRAM read.
+    logic        sae_busy, sae_sel_l;
+    logic [31:0] sae_addr_l;
+    logic        vsae_rsp_valid_r;
+    logic [31:0] vsae_rsp_data_r;
+    assign vsae_req_ready = !sae_busy;
+    assign verify_w_widx  = sae_addr_l;
+    assign verify_t_widx  = sae_addr_l;
+    assign vsae_rsp_valid = vsae_rsp_valid_r;
+    assign vsae_rsp_data  = vsae_rsp_data_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            sae_busy <= 1'b0; vsae_rsp_valid_r <= 1'b0;
+        end else begin
+            vsae_rsp_valid_r <= 1'b0;
+            if (vsae_req_valid && !sae_busy) begin
+                sae_sel_l <= vsae_req_sel; sae_addr_l <= vsae_req_addr; sae_busy <= 1'b1;
+            end else if (sae_busy) begin
+                vsae_rsp_valid_r <= 1'b1;
+                vsae_rsp_data_r  <= sae_sel_l ? verify_t_word : verify_w_word;
+                sae_busy         <= 1'b0;
+            end
+        end
+    end
+
+    // ---- shared L2 port mux: verifier owns during boot, checker after PASS ----
+    wire chk_owns_l2 = !boot_hold;
+    assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_owns_l2 ? chk_req_valid_eff : ver_mem_bus_if.req_valid;
+    assign l2_core_bus_if[CHK_L2_PORT].req_data  = chk_owns_l2 ? chk_act_bus_if.req_data : ver_mem_bus_if.req_data;
+    assign l2_core_bus_if[CHK_L2_PORT].rsp_ready = chk_owns_l2 ? chk_act_bus_if.rsp_ready : ver_mem_bus_if.rsp_ready;
+    assign chk_act_bus_if.req_ready = chk_owns_l2 ? (l2_core_bus_if[CHK_L2_PORT].req_ready && chk_req_ready_gate) : 1'b0;
+    assign chk_act_bus_if.rsp_valid = chk_owns_l2 ? l2_core_bus_if[CHK_L2_PORT].rsp_valid : 1'b0;
+    assign chk_act_bus_if.rsp_data  = l2_core_bus_if[CHK_L2_PORT].rsp_data;
+    assign ver_mem_bus_if.req_ready = chk_owns_l2 ? 1'b0 : l2_core_bus_if[CHK_L2_PORT].req_ready;
+    assign ver_mem_bus_if.rsp_valid = chk_owns_l2 ? 1'b0 : l2_core_bus_if[CHK_L2_PORT].rsp_valid;
+    assign ver_mem_bus_if.rsp_data  = l2_core_bus_if[CHK_L2_PORT].rsp_data;
+`else
+    assign l2_core_bus_if[CHK_L2_PORT].req_valid = chk_req_valid_eff;
+    assign chk_act_bus_if.req_ready = l2_core_bus_if[CHK_L2_PORT].req_ready && chk_req_ready_gate;
     assign l2_core_bus_if[CHK_L2_PORT].req_data  = chk_act_bus_if.req_data;
     assign chk_act_bus_if.rsp_valid = l2_core_bus_if[CHK_L2_PORT].rsp_valid;
     assign chk_act_bus_if.rsp_data  = l2_core_bus_if[CHK_L2_PORT].rsp_data;
     assign l2_core_bus_if[CHK_L2_PORT].rsp_ready = chk_act_bus_if.rsp_ready;
+`endif
 
     wire [15:0] checker_flag;
     wire        chk_all_done;
@@ -572,6 +749,14 @@ module VX_cluster import VX_gpu_pkg::*; #(
         .thresh_we_i      (t_we),
         .thresh_waddr_i   (t_waddr),
         .thresh_wdata_i   (t_wdata)
+`ifdef ATTEST_ENABLE
+        ,
+        .verify_active    (verify_active),
+        .verify_w_widx    (verify_w_widx),
+        .verify_w_word    (verify_w_word),
+        .verify_t_widx    (verify_t_widx),
+        .verify_t_word    (verify_t_word)
+`endif
     );
     `UNUSED_VAR (checker_flag);
 

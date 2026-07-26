@@ -89,6 +89,19 @@ module VX_checker import VX_gpu_pkg::*; #(
     input wire                                thresh_we_i,
     input wire [`CLOG2(MAX_FEATURES+2)-1:0]   thresh_waddr_i,
     input wire [15:0]                         thresh_wdata_i
+
+`ifdef ATTEST_ENABLE
+    // Boot-verifier read access to the SAE weight SRAM + threshold table.  Used
+    // only while the verifier holds the cores in reset (checker idle), so it
+    // time-shares the weight-SRAM read port via a raddr mux — no second port.
+    // Words are little-endian; two FP16 per 32-bit word.
+    ,
+    input  wire                                verify_active,
+    input  wire [31:0]                         verify_w_widx,  // weight word index
+    output wire [31:0]                         verify_w_word,
+    input  wire [31:0]                         verify_t_widx,  // threshold word index
+    output wire [31:0]                         verify_t_word
+`endif
 );
     // -------------------------------------------------------------------------
     // Localparams
@@ -492,6 +505,17 @@ module VX_checker import VX_gpu_pkg::*; #(
     // -------------------------------------------------------------------------
     wire [WEIGHT_DATAW-1:0] weight_row_out;
 
+    // Weight-SRAM read address: normally the systolic array's k index; during boot
+    // attestation the verifier drives the row (checker is idle, held in reset).
+    wire [WEIGHT_ADDRW-1:0] weight_raddr;
+`ifdef ATTEST_ENABLE
+    localparam LOG_WORDS_PER_ROW = `CLOG2(MAX_FEATURES/2);   // FP16 pairs per row
+    wire [WEIGHT_ADDRW-1:0] verify_w_row = WEIGHT_ADDRW'(verify_w_widx >> LOG_WORDS_PER_ROW);
+    assign weight_raddr = verify_active ? verify_w_row : k_count[0][WEIGHT_ADDRW-1:0];
+`else
+    assign weight_raddr = k_count[0][WEIGHT_ADDRW-1:0];
+`endif
+
     VX_dp_ram #(
         .DATAW       (WEIGHT_DATAW),
         .SIZE        (MAX_HIDDEN),
@@ -508,7 +532,7 @@ module VX_checker import VX_gpu_pkg::*; #(
         .waddr (weight_waddr_i),
         .wdata (weight_wdata_i),
         .read  (1'b1),
-        .raddr (k_count[0][WEIGHT_ADDRW-1:0]),
+        .raddr (weight_raddr),
         .rdata (weight_row_out)
     );
 
@@ -526,6 +550,24 @@ module VX_checker import VX_gpu_pkg::*; #(
         if (thresh_we_i)
             threshold[thresh_waddr_i] <= thresh_wdata_i;
     end
+
+`ifdef ATTEST_ENABLE
+    // Boot-verifier read-out: extract the requested 32-bit word from the current
+    // SRAM row (combinational read), and pack two uint16 thresholds per word.
+    wire [LOG_WORDS_PER_ROW-1:0] verify_w_col = verify_w_widx[LOG_WORDS_PER_ROW-1:0];
+    assign verify_w_word = weight_row_out[verify_w_col*32 +: 32];
+
+    // threshold[] is indexed 0..MAX_FEATURES; guard the high half of the final
+    // word (2*widx+1 can reach MAX_FEATURES+1, which the verifier ignores anyway).
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [31:0] vt_lo = verify_t_widx * 32'd2;
+    wire [31:0] vt_hi = verify_t_widx * 32'd2 + 32'd1;
+    /* verilator lint_on UNUSEDSIGNAL */
+    assign verify_t_word = {
+        (vt_hi <= 32'(MAX_FEATURES)) ? threshold[vt_hi[`CLOG2(MAX_FEATURES+1)-1:0]] : 16'h0,
+        threshold[vt_lo[`CLOG2(MAX_FEATURES+1)-1:0]]
+    };
+`endif
 
     // Extract the current feat_tile's N_FEAT column slice from the SRAM output row.
     // feat_tile is stable for the entire duration of a pass, so this mux is fine.

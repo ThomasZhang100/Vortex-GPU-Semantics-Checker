@@ -51,6 +51,13 @@ ifneq (,$(findstring -DCHECKER_ENABLE, $(CONFIGS)))
 	RTL_PKGS += $(shell find $(RTL_DIR)/core/sauria -name '*.sv')
 endif
 
+# Boot attestation (Task C): the verifier/adapter modules are found via the -I core
+# include dir, but VX_attest_pkg must be listed explicitly (packages are compiled
+# ahead of use, unlike modules which Verilator resolves by name from -I dirs).
+ifneq (,$(findstring -DATTEST_ENABLE, $(CONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/VX_attest_pkg.sv
+endif
+
 # Add V extension sources
 ifneq (,$(findstring -DEXT_V_ENABLE, $(CONFIGS)))
 	RTL_PKGS += $(RTL_DIR)/vpu/VX_vpu_pkg.sv

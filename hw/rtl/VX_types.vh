@@ -43,6 +43,16 @@
 `define VX_DCR_CHECKER_TRIG_ADDR_LO1   12'h01A  // trigger range low  [63:32] (XLEN_64 only)
 `define VX_DCR_CHECKER_TRIG_ADDR_HI1   12'h01B  // trigger range high [63:32] (XLEN_64 only)
 
+// Boot-time attestation / verified launch (Task C) //////////////////////////
+// Flow: host streams the signed manifest word-by-word into the manifest SRAM
+// (MANIFEST_DATA), then writes VERIFY_START=1 to kick the boot verifier.  The
+// verifier holds all cores in reset until every region hash matches the manifest
+// and the Ed25519 signature verifies; only then does it release boot at the
+// manifest's verified startup_addr.  Status is polled from VRAM at status_addr
+// (the DCR bus is write-only), so no status DCR is needed.
+`define VX_DCR_ATTEST_MANIFEST_DATA    12'h01C  // stream 32b LE words into manifest SRAM (auto-advance)
+`define VX_DCR_ATTEST_VERIFY_START     12'h01D  // write 0: rewind manifest pointer + reset verifier (arm for streaming); write 1: start verification
+
 // Checker compile-time geometry — the checker's weight-SRAM capacity (build-time).
 // Single source of truth: RTL (VX_cluster, VX_checker_synth_top), the kernel, and the
 // host (main.cpp) all derive from these, so they stay in sync.  Override at build time
