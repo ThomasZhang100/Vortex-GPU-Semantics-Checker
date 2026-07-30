@@ -16,6 +16,8 @@ reused. RTL compile-time parameters (B_TILE=4, N_FEAT=16, MAX_BATCH, MAX_FEATURE
 are fixed at build time and must match the ranges tested here.
 """
 
+from __future__ import annotations  # allow tuple[int,str] annotations on Python 3.8
+
 import argparse
 import os
 import re
@@ -32,7 +34,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 REPO_ROOT  = Path(__file__).resolve().parents[3]          # vortex-research/
 BUILD_DIR  = REPO_ROOT / "build"
-TEST_DIR   = Path(__file__).parent
+TEST_DIR   = Path(__file__).resolve().parent   # absolute: -A/-W/-C paths must resolve from the sim's cwd, not the script's
 WEIGHT_HEX = TEST_DIR / "sae_weights_test.hex"   # kept for debugging / $readmemh reference
 THRESH_HEX = TEST_DIR / "thresholds.hex"          # kept for debugging / $readmemh reference
 ACT_BIN    = TEST_DIR / "act_test.bin"            # FP32 activation binary injected via -A

@@ -6,6 +6,15 @@ that tensor off L2, runs the selected-feature SAE matmul + threshold in its
 systolic array, and raises per-token flags. This directory holds the host/kernel
 program and the Python tooling that feeds it inputs and checks its output.
 
+## Python requirements
+
+The scripts here need **Python ≥ 3.8** and **NumPy**. 
+
+```bash
+apt-get install -y python3-pip
+pip3 install numpy
+```
+
 ## Typical workflow
 
 ```bash

@@ -1,134 +1,238 @@
-# Vortex GPGPU
+# Measured Models: Non-Bypassable Hardware Semantic Checking
 
-Vortex is a full-stack open-source RISC-V GPGPU. Vortex supports multiple **backend drivers**, including our C++ simulator (simx), an RTL simulator, and physical Xilinx and Altera FPGAs-- all controlled by a single driver script. The chosen driver determines the corresponding code invoked to run Vortex. Generally, developers will prototype their intended design in simx, before completing going forward with an RTL implementation. Alternatively, you can get up and running by selecting a driver of your choice and running a demo program.
+A research fork of [Vortex](https://github.com/vortexgpgpu/vortex).
+The base GPU, build system, toolchain, and runtime are all Vortex — credit goes to the Vortex authors (MICRO'21); their original README
+is preserved verbatim at [README.upstream.md](README.upstream.md).
 
-## Website
-Vortex news can be found on its [website](https://vortex.cc.gatech.edu/)
+This page covers only the additions made in this fork: the non-bypassable
+semantic checker (VX_checker), boot-time runtime image verification (VX_boot_verifier), 
+the SHA-256 core, the manifest format, and the two regression tests. 
 
-## Citation
-```
-@inproceedings{10.1145/3466752.3480128,
-	author = {Tine, Blaise and Yalamarthy, Krishna Praveen and Elsabbagh, Fares and Hyesoon, Kim},
-	title = {Vortex: Extending the RISC-V ISA for GPGPU and 3D-Graphics},
-	year = {2021},
-	isbn = {9781450385572},
-	publisher = {Association for Computing Machinery},
-	address = {New York, NY, USA},
-	url = {https://doi.org/10.1145/3466752.3480128},
-	doi = {10.1145/3466752.3480128},
-	abstract = {The importance of open-source hardware and software has been increasing. However, despite GPUs being one of the more popular accelerators across various applications, there is very little open-source GPU infrastructure in the public domain. We argue that one of the reasons for the lack of open-source infrastructure for GPUs is rooted in the complexity of their ISA and software stacks. In this work, we first propose an ISA extension to RISC-V that supports GPGPUs and graphics. The main goal of the ISA extension proposal is to minimize the ISA changes so that the corresponding changes to the open-source ecosystem are also minimal, which makes for a sustainable development ecosystem. To demonstrate the feasibility of the minimally extended RISC-V ISA, we implemented the complete software and hardware stacks of Vortex on FPGA. Vortex is a PCIe-based soft GPU that supports OpenCL and OpenGL. Vortex can be used in a variety of applications, including machine learning, graph analytics, and graphics rendering. Vortex can scale up to 32 cores on an Altera Stratix 10 FPGA, delivering a peak performance of 25.6 GFlops at 200 Mhz.},
-	booktitle = {MICRO-54: 54th Annual IEEE/ACM International Symposium on Microarchitecture},
-	pages = {754–766},
-	numpages = {13},
-	keywords = {reconfigurable computing, memory systems., computer graphics},
-	location = {Virtual Event, Greece},
-	series = {MICRO '21}
-}
-```
+This fork adds two main hardware mechanisms on top of the Vortex GPGPU:
 
-## Specifications
+1. **A sparse auto-encoder accelerator**: a systolic array that taps the
+   model's hidden state directly off L2, runs a selected-feature SAE matmul + threshold in parallel with the main datapath, and raises a per-token flag. 
+2. **Boot-time attestation / verified launch**: before the cores are
+   allowed to execute, hardware independently hashes the model weights, kernel,
+   kernel args, and the SAE weights/thresholds, and checks them (plus a signature)
+   against a signed manifest. Cores are held in reset until every hash matches;
+   a tampered image never runs.
 
-- Support RISC-V RV32IMAF and RV64IMAFD
+---
 
-- Microarchitecture:
-    - configurable number of cores, warps, and threads.
-    - configurable number of ALU, FPU, LSU, and SFU units per core.
-    - configurable pipeline issue width.
-    - optional local memory, L1, L2, and L3 caches.
-- Software:
-    - OpenCL 1.2 Support.
-- Supported FPGAs:
-    - Altera Arria 10
-    - Altera Stratix 10
-    - Xilinx Alveo U50, U250, U280
-    - Xilinx Versal VCK5000
+## File Walkthrough
 
-## Directory structure
+| File | Purpose |
+|------|---------|
+| hw/rtl/core/VX_checker.sv | Semantic checker: L2 snoop and output-stationary systolic sparse auto-encoder accelerator. |
+| hw/rtl/core/VX_boot_verifier.sv | Boot verifier FSM: walks the signed manifest, hashes each region, compares, gates boot |
+| hw/rtl/core/VX_boot_mem_adapter.sv | Adapter for the verifier's VRAM reads and status write |
+| hw/rtl/libs/VX_sha256.sv | Streaming SHA-256 core, one 512-bit block / 64 cycles |
+| hw/rtl/VX_attest_pkg.sv | Manifest layout package |
+| hw/rtl/VX_cluster.sv | CHECKER_ENABLE block adds checker control registers and L1 to L2 bus tap; ATTEST_ENABLE block adds manifest SRAM, verifier/adapter instances, shared-L2-port mux, and boot gate |
+| hw/rtl/VX_types.vh | VX_DCR_CHECKER_* and VX_DCR_ATTEST_* device-control registers |
+| tests/regression/checker_test/ | Host + kernel test for the checker ([README](tests/regression/checker_test/README.md)) |
+| tests/regression/attest_test/ | End-to-end execution image verification test: signed manifest verification, boot gate, and GEMM ([README](tests/regression/attest_test/README.md)) |
 
-- `doc`: [Documentation](docs/index.md).
-- `hw`: Hardware sources.
-- `driver`: Host drivers repository.
-- `runtime`: Kernel Runtime software.
-- `sim`: Simulators repository.
-- `tests`: Tests repository.
-- `ci`: Continuous integration scripts.
-- `miscs`: Miscellaneous resources.
+The RTL necessary for each test are behind compile-time flags (-DCHECKER_ENABLE,-DATTEST_ENABLE)
+and are absent from the default build, so the upstream GPU is unchanged unless you
+opt in.
 
-## Quick Start
-If you are interested in a stable release of Vortex, you can download the latest release [here](https://github.com/vortexgpgpu/vortex/releases/latest). Otherwise, you can pull the most recent, but (potentially) unstable version as shown below. The following steps demonstrate how to build and run Vortex with the default driver: SimX. If you are interested in a different backend, look [here](docs/simulation.md).
+---
 
-### Supported OS Platforms
-- Ubuntu 22.04, 24.04
-- Centos 7
-### Toolchain Dependencies
-The following dependencies will be fetched prebuilt by `toolchain_install.sh`.
-- [POCL](http://portablecl.org/)
-- [LLVM](https://llvm.org/)
-- [RISCV-GNU-TOOLCHAIN](https://github.com/riscv-collab/riscv-gnu-toolchain)
-- [Verilator](https://www.veripool.org/verilator)
-- [cvfpu](https://github.com/openhwgroup/cvfpu.git)
-- [SoftFloat](https://github.com/ucb-bar/berkeley-softfloat-3.git)
-- [Ramulator](https://github.com/CMU-SAFARI/ramulator.git)
-- [Yosys](https://github.com/YosysHQ/yosys)
-- [Sv2v](https://github.com/zachjs/sv2v)
-### Install Vortex codebase
-```sh
-	git clone --depth=1 --recursive https://github.com/vortexgpgpu/vortex.git
-	cd vortex
-```
-### Install system dependencies
-```sh
-# ensure dependent libraries are present
-sudo ./ci/install_dependencies.sh
-```
-### Configure your build folder
-```sh
-    mkdir build
-    cd build
-    # for 32bit
-    ../configure --xlen=32 --tooldir=$HOME/tools
-    # for 64bit
-    ../configure --xlen=64 --tooldir=$HOME/tools
-```
-### Install prebuilt toolchain
-```sh
-   ./ci/toolchain_install.sh --all
-```
-### set environment variables
-```sh
-    # should always run before using the toolchain!
-    source ./ci/toolchain_env.sh
-```
-### Building Vortex
-```sh
-make -s
-```
-### Quick demo running vecadd OpenCL kernel on 2 cores
-```sh
-./ci/blackbox.sh --cores=2 --app=vecadd
+## Architecture
+
+### System overview
+
+The verifier and the checker **time-share one L2 port**: the verifier owns it while
+the cores are held in reset (during attestation), and hands it to the checker the
+instant boot is released. They never overlap in time, so this costs one mux, not a
+second port.
+
+```mermaid
+flowchart TB
+  subgraph Host["Host (CPU) — main.cpp"]
+    H1["upload model weights / kernel / args → VRAM"]
+    H2["stream SAE weights + thresholds → checker SRAM (DCR)"]
+    H3["build + sign manifest → manifest SRAM (DCR)"]
+    H4["VERIFY_START, then vx_start"]
+  end
+
+  subgraph Chip["Vortex cluster — VX_cluster.sv"]
+    MSRAM["Manifest SRAM"]
+    VER["VX_boot_verifier (FSM + SHA-256)"]
+    ADP["VX_boot_mem_adapter (word to line)"]
+    MUX{"shared L2 port mux (chk_owns_l2 = !boot_hold)"}
+    CHK["VX_checker (systolic SAE matmul)"]
+    L2["L2 cache"]
+    GATE["boot gate (cluster_core_reset = reset OR boot_hold)"]
+    CORES["GPU cores"]
+  end
+
+  H1 --> L2
+  H2 --> CHK
+  H3 --> MSRAM
+  H4 --> VER
+  MSRAM --> VER
+  VER --> ADP --> MUX
+  CHK --> MUX
+  MUX --> L2
+  VER -.->|reads SAE SRAM back to hash| CHK
+  VER -->|boot_release, PASS only| GATE --> CORES
+  CORES -->|GEMM reads/writes| L2
+  L2 -.->|tapped hidden state| CHK
+  CHK --> FLAG["per-token flag"]
 ```
 
-### Common Developer Tips
-- Installing Vortex kernel and runtime libraries to use with external tools requires passing --prefix=<install-path> to the configure script.
-```sh
-../configure --xlen=32 --tooldir=$HOME/tools --prefix=<install-path>
-make -s
-make install
+### Boot verifier FSM (Task C)
+
+On an arm edge the verifier walks the manifest header, then loops over every
+attested region — **signature → kernel → args → SAE weights → SAE thresholds →
+each per-layer weight region** — hashing each through the single SHA-256 core and
+comparing to the manifest's stored hash. The **first mismatch aborts** with a fail
+code (and layer index for weights). `boot_release` is asserted only on the
+all-pass path, so it is structurally impossible to release the cores without every
+check having passed — the non-bypassability argument, in RTL.
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> HEADER: start (arm edge after reset)
+  HEADER --> STATUS: magic / version bad
+  HEADER --> CHECK: header OK
+  state CHECK {
+    [*] --> DISPATCH
+    DISPATCH --> SETUP: pick region (addr/len/hash)
+    SETUP --> HASH: stream bytes to SHA-256
+    HASH --> COMPARE: digest vs manifest hash
+    COMPARE --> [*]
+  }
+  CHECK --> NEXT: match
+  CHECK --> STATUS: mismatch (FAIL code[,layer])
+  NEXT --> CHECK: more regions
+  NEXT --> STATUS: all regions passed
+  STATUS --> DONE: write status word; boot_release if PASS
+  DONE --> [*]
 ```
-- Building Vortex 64-bit requires setting --xlen=64 configure option.
-```sh
-../configure --xlen=64 --tooldir=$HOME/tools
+
+The check order matters: the **signature is verified first** (it covers the whole
+manifest body, so every stored address and hash is authenticated before the
+verifier trusts them). Content regions are hashed afterward, so tampering with the
+*device data* after signing is caught by that region's own hash with per-layer
+localization. See [`hw/rtl/core/VX_boot_verifier.sv`](hw/rtl/core/VX_boot_verifier.sv)
+for the full state machine.
+
+### Semantic checker (Task B)
+
+The checker is an **output-stationary systolic array** (default `B_TILE × N_FEAT`
+= 4 × 16 PEs). Each PE holds one accumulator stationary across all `K` hidden
+dimensions; activations flow rightward, SAE decoder weights flow downward, and the
+indices always meet. After `K + skew` cycles the accumulators complete, go through
+a per-feature threshold, and a token is flagged when its fired-feature count
+exceeds `k`. The SAE weights live in a **private SRAM** with no model read/write
+path, so they can't be profiled or forged.
+
+```mermaid
+flowchart LR
+  L2["L2 cache"] -->|tap hidden state, fp32 to fp16| FIFO["per-row FIFOs"]
+  SRAM["SAE weight SRAM (private)"] --> ARR
+  FIFO --> ARR["output-stationary systolic array (B_TILE x N_FEAT)"]
+  ARR -->|per-feature values| THR["threshold compare"]
+  THR -->|fired count > k| FLAG["per-token flag"]
 ```
-- Sourcing "./ci/toolchain_env.sh" is required everytime you start a new terminal. we recommend adding "source <build-path>/ci/toolchain_env.sh" to your ~/.bashrc file to automate the process at login.
+
+See [`hw/rtl/core/VX_checker.sv`](hw/rtl/core/VX_checker.sv) and the
+[checker_test README](tests/regression/checker_test/README.md) for the dataflow
+and skew details.
+
+---
+
+## Environment setup (one-time)
+
+Vortex uses an **out-of-tree build** (everything lives under `build/`). From a
+fresh clone:
+
 ```sh
-echo "source <build-path>/ci/toolchain_env.sh" >> ~/.bashrc
+# 1. submodules (softfloat, ramulator, cvfpu, hardfloat) — required
+git submodule update --init --recursive
+
+# 2. system dependencies (Ubuntu; needs root/sudo)
+./ci/install_dependencies.sh
+
+# 3. create the build dir and configure
+mkdir -p build && cd build
+../configure --xlen=32 --tooldir=$HOME/tools
+
+# 4. install the prebuilt toolchain: RISC-V GNU + LLVM + Verilator (large, one-time)
+./ci/toolchain_install.sh --all
 ```
-- Making changes to Makefiles in your source tree or adding new folders will require executing the "configure" script again without any options to get changes propagated to your build folder.
+
+Then, in **every new shell**, source the toolchain environment:
+
 ```sh
-../configure
+cd build
+source ./ci/toolchain_env.sh   # sets PATH/vars for RISC-V clang, Verilator, etc.
 ```
-- To debug the GPU, the simulation can generate a runtime trace for analysis. See /docs/debugging.md for more information.
+
+Build the two support libraries once (the rtlsim driver and the GPU kernels link
+these). **Do not run the top-level `make`** — it also builds the OPAE/XRT FPGA
+shims these tests never use and can exhaust a small or emulated host:
+
 ```sh
-./ci/blackbox.sh --app=demo --debug=3
+# from build/, with toolchain_env sourced
+make -C ../third_party    # softfloat + ramulator libs (rtlsim driver links these)
+make -C kernel            # kernel/libvortex.a (GPU-side runtime the kernel links)
 ```
-- For additional information, check out the [documentation](docs/index.md)
+
+**Python** (for the test harnesses): Python ≥ 3.8. `checker_test`'s harness needs
+NumPy; `attest_test`'s is stdlib-only.
+
+```sh
+apt-get install -y python3-numpy   # or: pip3 install numpy
+```
+
+These dependencies are baked into `Dockerfile.dev`, so a freshly built dev image
+already has them.
+
+---
+
+## Running the tests
+
+Both tests run under the `rtlsim` (Verilator) driver, which simulates the actual
+RTL. The first run Verilates + compiles the driver (~10–25 min under emulation);
+it's cached afterward.
+
+### checker_test — the semantic checker
+
+```sh
+# from build/, toolchain sourced
+CONFIGS="-DCHECKER_ENABLE" make -s -j4        # build the RTL with the checker (once)
+python3 ../tests/regression/checker_test/run_tests.py   # correctness sweep
+```
+
+Full flag/mode reference and the weight/threshold loading model:
+**[tests/regression/checker_test/README.md](tests/regression/checker_test/README.md)**.
+
+### attest_test — boot attestation end-to-end
+
+Exercises the whole chain: attest weights/kernel/args/SAE → release boot → GEMM
+runs → checker taps the GEMM output. A valid manifest runs the GEMM; any tamper
+blocks it.
+
+```sh
+# from build/, toolchain sourced
+python3 ../tests/regression/attest_test/run_tests.py                 # valid + all tampers
+python3 ../tests/regression/attest_test/run_tests.py --cases none    # valid case only (fastest first check)
+```
+
+Tamper modes, status codes, and the pass/fail signal:
+**[tests/regression/attest_test/README.md](tests/regression/attest_test/README.md)**.
+
+---
+
+## Design docs
+
+The full design rationale (threat model, manifest format, phased Ed25519 plan,
+experiment matrix) lives in [`CLAUDE.md`](CLAUDE.md) under
+"Research Paper: Non-Bypassable Hardware Semantic Checking" and
+"Boot-Time Attestation / Verified Launch".

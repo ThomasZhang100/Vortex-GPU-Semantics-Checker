@@ -7,6 +7,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y build-essential valgrind git wget libpng-dev libboost-all-dev uuid-dev ccache cmake
 
+# Python for the regression test harnesses (tests/regression/*/run_tests.py).
+# Ubuntu 20.04 ships Python 3.8; the harnesses use `from __future__ import
+# annotations` so they run there. checker_test/run_tests.py needs numpy;
+# attest_test/run_tests.py is stdlib-only. pip is included for convenience.
+RUN apt-get install -y python3 python3-pip python3-numpy
+
 # Third-Party Repository to Install g++11 on Ubuntu 18.04
 RUN apt-get install -y manpages-dev software-properties-common
 RUN add-apt-repository -y ppa:ubuntu-toolchain-r/test

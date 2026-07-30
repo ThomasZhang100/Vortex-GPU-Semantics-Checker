@@ -39,6 +39,8 @@ port and SAE-SRAM read ports). `blackbox.sh` forwards `CONFIGS` to both the RTL
 driver build and the app build, so the host sees the same `-DVX_CHECKER_MAX_FEATURES`
 as the hardware.
 
+**Python:** `run_tests.py` needs only **Python ≥ 3.8** 
+
 ## Build / environment setup
 
 Vortex uses an **out-of-tree build** (everything lives under `build/`). From a
@@ -65,12 +67,6 @@ Then, in **every new shell**, source the toolchain environment:
 cd build
 source ./ci/toolchain_env.sh   # sets PATH/vars for RISC-V clang, Verilator, etc.
 ```
-
-**Do not run the top-level `make`.** It builds every simulator, including the
-OPAE/XRT FPGA shims this test never uses, which can exhaust a small or emulated
-host (e.g. Docker on Apple Silicon). Instead build only the two components that
-`blackbox.sh` does *not* build itself, then let blackbox build the rest (hw config,
-runtime, the rtlsim driver — which Verilates the RTL — and the app):
 
 ```sh
 # from build/, with toolchain_env sourced
